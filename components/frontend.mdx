@@ -1,0 +1,69 @@
+---
+title: 'Repo Overview: cerebrum / Frontend'
+description: Next.js 16 / React 19 dashboard. Lives in-tree at apps/frontend/. Hosted
+  on Vercel.
+---
+
+Next.js 16 / React 19 dashboard. Lives in-tree at
+`apps/frontend/`. Hosted on Vercel.
+
+## What this area owns
+
+- Page surfaces: `/` (dashboard), `/workflows`, `/agents`,
+  `/atlas` (3D graph), `/multi`, `/knowledge` (admin KB edit).
+- SSE consumption of Mother AI's per-job event stream and rendering of
+  backlog + live events.
+- Project lifecycle UI (create, list, link to workspaces).
+- Workflow editor and runner (graph + prompt composer + panels).
+- Atlas (3D knowledge graph using `@react-three/fiber` /
+  `@react-three/drei` / `d3-force-3d`).
+- Command-centre and telemetry views.
+- Glass design system (Tailwind + Radix primitives + shadcn-style
+  components).
+
+## What this area does not own
+
+- Job execution or model dispatch (worker).
+- Ingest, auth, queue publish, or projects persistence (Mother AI).
+- Workspace provisioning or Vercel deploy triggers (worker).
+
+## Key files
+
+- `apps/frontend/lib/use-job-stream.ts` —
+  SSE consumer hook; replays backlog, then live events; supports
+  `ask_user` interrupts via `POST /v1/jobs/:id/resume`.
+- `apps/frontend/lib/mother-ai-client.ts` —
+  typed wrapper around Mother AI's REST surface.
+- `apps/frontend/components/dashboard/shell.tsx` — top-level shell.
+- `apps/frontend/components/graph/*` — 3D atlas and 2D workflow graph.
+- `apps/frontend/components/workflow/panels/*` — workflow prompt
+  composer, job-detail panel, panel layout.
+- `apps/frontend/lib/use-ollama-status.ts` /
+  `apps/frontend/lib/ollama-wake-eta.ts` — Ollama health + wake ETA UI.
+- `apps/frontend/lib/knowledge/*` — `/knowledge` admin edit surface
+  that posts back to Mother AI's `/v1/kb/edit`.
+- `apps/frontend/app/api/*` — Next.js route handlers (server-side
+  glue; no business logic — proxies to Mother AI).
+
+## Key implementation expectations
+
+- The frontend is **stateless beyond local UI state**. Every long-lived
+  resource (jobs, projects, workflows, hub edits) lives in Postgres or
+  Qdrant via Mother AI.
+- SSE is the primary live channel. The `useJobStream` hook must
+  *replay* the durable backlog before joining the pubsub stream so a
+  reconnecting client never misses events.
+- React-Query (`@tanstack/react-query`) owns server-state caching;
+  invalidation keys live under
+  `apps/frontend/lib/footer-query-keys.ts`.
+- `biome` is the lint/format gate (`pnpm lint`); type-check via
+  `pnpm tsc --noEmit -p .`.
+
+## Relevant request patterns
+
+- "Render an `ask_user` interrupt and resume the job"
+- "Show live token streaming from L4 with heartbeats"
+- "Edit a knowledge-hub doc from the admin UI"
+- "Render the 3D atlas with tier-filtered nodes"
+- "Switch model in the prompt composer dropdown"
+- "Diff a workflow run against its template"

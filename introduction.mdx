@@ -1,0 +1,211 @@
+---
+title: Cerebrum — system overview
+description: This is the top-level digest of Cerebrum as it actually runs today (2026-05-06).
+  It is the entry point retrieval surfaces when a partner or agent asks "what is Cerebrum?".
+  For the policy form, see 01_UNIVERSAL_RULES.md. For the system me...
+---
+
+This is the top-level digest of Cerebrum *as it actually runs today*
+(2026-05-06). It is the entry point retrieval surfaces when a partner or
+agent asks "what is Cerebrum?". For the policy form, see
+`01_UNIVERSAL_RULES.md`. For
+the system mechanism details, see
+`02_ARCHITECTURE.md`. For the
+repo / scope index, see
+`03_REPO_INDEX.md`.
+
+## What it is
+
+- Cerebrum is a **queue-first AI orchestration platform** that runs a
+  multi-agent hierarchy against free and paid models, augmented by a
+  retrieval-grounded knowledge hub, with full audit trails and
+  per-project workspace provisioning.
+- It is not a chat product. The design centre is *throughput, audit, and
+  multi-agent governance*: every prompt becomes a Redis-backed job,
+  every step emits a typed event, every escalation is logged, and every
+  paid call is cost-tracked.
+- Cerebrum is the OS layer for the GDI Labs thesis — "AI workforce + human
+  governance" — not an enterprise AI tooling skin around foundation
+  models.
+
+## Architecture & mechanics
+
+- **Mother AI (Rust/Axum)**: stateless ingest. Authenticates via
+  Authorization-header API tokens against team policy, persists
+  projects/workflows in Postgres, enqueues jobs to Redis, exposes SSE
+  streams, probes models, and wakes Ollama on demand. Owns no
+  model-execution decisions. Endpoints: `/v1/chat`, `/v1/jobs/:id`,
+  `/v1/jobs/:id/stream`, `/v1/jobs/:id/resume`, `/v1/projects`,
+  `/v1/workflows`, `/v1/models`, `/v1/ollama/*`,
+  `/v1/command/intents`. See
+  [`projects/cerebrum/components/mother-ai.md`](/components/mother-ai).
+- **Worker (Python / LangGraph)**: pulls jobs from Redis, runs the
+  context engine to inject knowledge-hub augments, classifies the
+  prompt, dispatches it through the L1–L4 hierarchy, and emits typed
+  `AgentEvent` JSON. Owns escalation accounting, project workspace
+  provisioning, and the diary writer. Hot-reloads hub changes via a
+  refresher thread (no worker restart needed). See
+  [`projects/cerebrum/components/worker.md`](/components/worker).
+- **Frontend (Next.js 16 / React 19)**: dashboard at `/`, plus
+  `/workflows`, `/agents`, `/atlas` (3D graph), `/multi`, and
+  `/knowledge` (admin edit surface for the hub). Consumes Mother AI's
+  SSE stream via the `useJobStream` hook, manages projects, picks
+  models. See
+  [`projects/cerebrum/components/frontend.md`](/components/frontend).
+- **Knowledge Hub** (this directory): canonical org corpus. Validated
+  by `.kb/lint/lint_frontmatter.py`, ingested by `ingest/ingest_hub.py`
+  into Qdrant, retrieved by the worker's context engine, edited by
+  humans via `/knowledge` and by agents via the diary writer, and
+  exposed read-only over the `cerebrum-kb` MCP server.
+- **`mcp/cerebrum-kb`**: stdio MCP server that wraps Mother AI's
+  knowledge-hub APIs. Same auth, same tier filters, same audit
+  trail — no parallel codepath into Qdrant/Postgres. Writes are
+  deliberately not exposed: human edits go through `/knowledge`,
+  agent edits through the diary writer. See
+  [`projects/cerebrum/components/mcp-cerebrum-kb.md`](/components/mcp-cerebrum-kb).
+- **Ingest pipeline**: `ingest/ingest_hub.py` reads markdown from
+  `knowledge-hub/`, parses YAML frontmatter, chunks by heading,
+  embeds via Ollama (default `nomic-embed-text`) or
+  OpenAI (`text-embedding-3-small`), and upserts into Qdrant.
+  Postgres-backed manifest (`kb_ingest_manifest`) makes it
+  incremental; orphans are swept. See
+  [`projects/cerebrum/components/ingest.md`](/components/ingest).
+
+### Core flow
+
+1. Client (frontend or external) sends a prompt to Mother AI.
+2. Mother AI authenticates, persists/upserts any project metadata,
+   enqueues a job in Redis.
+3. Worker pulls the job, runs the context engine, classifies, and
+   dispatches through L1–L4.
+4. Worker emits typed `AgentEvent` JSON to a Redis list and pubsub
+   channel as work progresses.
+5. Frontend (or any client) subscribes via Mother AI's
+   `GET /v1/jobs/:id/stream` and renders backlog + live events.
+6. Worker persists job state, audit trail, and escalation history to
+   Postgres; for project tasks it provisions a workspace and (where
+   configured) triggers a Vercel deployment.
+
+### Hierarchy & routing
+
+- **L1 — Team Lead** (free model): orchestration only — classify, plan,
+  delegate.
+- **L2 — Managerial paid roles**: Architect, Tech Lead, Release
+  Manager, QA / Security / Adversarial leadership.
+- **L3 — Acceptance**: free-model verifier; pass/fail with deltas, not
+  rewrites.
+- **L4 — Executor**: paid-model file-write specialist; emits *only*
+  net-new files and surgical edits; streams tokens with periodic
+  heartbeats.
+- **Routing**: housekeeping prompts → free; architecture, implementation,
+  high-risk → paid. Worker's `routing_node` is policy-driven via
+  `config/team_controls.yaml` plus explicit `routing_hint` overrides.
+- **Escalation**: same-level conflict resolution with max 3 retries
+  before moving upward. Sub-job nesting depth = 2.
+
+## Models, providers, and locked defaults
+
+- **Free-model providers**: Ollama (local or remote, woken on demand by
+  the `ollama-controller` workload before dispatch); thinking models
+  include `qwen3:14b` and `qwen3.6-27b`.
+- **Paid-model providers**: Claude (e.g. `claude-opus-4-7`) and
+  OpenAI-compatible endpoints. Provider allowlists and per-provider
+  model lists live in
+  `config/team_controls.yaml`.
+- **Provider health**: `worker/llm/health.py` ranks success/failure;
+  failed providers are de-preferred for subsequent jobs.
+- **Locked defaults**: context engine runs in the worker before
+  routing; Mother AI is stateless beyond projects/workflows; sub-job
+  depth = 2; escalation retries per conflict = 3.
+
+## Infrastructure
+
+- **AWS EKS** (`ap-east-1`, cluster `cerebrum-dev`) is the primary
+  substrate (`terraform/platform/aws/`).
+- **Ortcloud** is the standby/failover substrate
+  (`terraform/platform/ortcloud/`); cutover/standby procedures live in
+  `docs/ortcloud-cutover-runbook.md` and
+  `docs/multicloud-standby-runbook.md`.
+- **Workloads** (`terraform/workloads/`) are cloud-agnostic
+  Helm/manifests for: `mother-ai`, `workers`, `postgres`, `redis`,
+  `qdrant`, `ollama`, `ingress-nginx-helm`, `cert-manager`,
+  `telemetry-api`, `ollama-controller`, `eks`, `backups`.
+- **Vercel** hosts the frontend; deployments are driven from the
+  worker per project.
+- **CronJobs in-cluster**: `cerebrum-scheduler` (workflow scheduler)
+  and `ingest-bootstrap` (knowledge-hub ingest) run inside the
+  `cerebrum` namespace; the ingest CronJob runs after a git-clone init
+  container hydrates `knowledge-hub/`.
+
+## Knowledge Hub v2 — current state
+
+The hub is mid-rollout against the v2 plan. **As of 2026-05-06**:
+
+- **Phase 0 (lint + ingest payload indices)** — done. Frontmatter
+  schema at `.kb/schema/frontmatter.schema.json`, lint gate
+  `.kb/lint/lint_frontmatter.py` wired into CI as
+  `lint-kb-frontmatter`, payload indices for `kh_id`, `scope`,
+  `scope_prefixes`, `sensitivity`, `source_type`, `team`, `tags`.
+- **Phase 1 (retrieval eval)** — done. `eval/golden-qa.yaml` +
+  `eval/run.py` report Recall@5 / Recall@10 / MRR; CI gate via
+  `--fail-under`.
+- **Phase 2 (admin edit + auto-merge for diaries)** — done. Mother AI
+  exposes `/knowledge` for human edits; agent diary writes go through
+  `/v1/kb/edit` with auto-merge on the `diaries/` allowlist.
+- **Phase 3 (KB MCP server)** — done. `mcp/cerebrum-kb` is a stdio
+  binary anyone can wire into Claude Desktop / `claude mcp add`.
+- **Phase 4 (cross-repo connectors)** — pending. Notion / Slack /
+  PDF connectors land into `sources/<connector>/`.
+
+## Governance & risk surface
+
+- **Team controls**: `config/team_controls.yaml` enforces user/org
+  IDs, rate limits (per-user and per-org per minute), provider and
+  per-provider model allowlists, and PII redaction at the request
+  boundary.
+- **Sensitivity tiers**: every doc carries `sensitivity` ∈
+  `public | partner | internal | secret`. Tier filtering is enforced at
+  retrieval time; partners only see their tier-filtered view (auto-
+  generated under `partners/`).
+- **Audit trail**: every job persists status, escalation history, cost,
+  and the augmented payload to Postgres.
+  `contracts/augmented_payload.schema.json` is the cross-service
+  contract.
+- **Centralisation risk to flag**: Mother AI's API tokens grant
+  job-submission rights; the diary writer's allowlist makes
+  `diaries/` no-review-merge — both warrant strict rotation and
+  network-policy boundaries.
+
+## Integration notes
+
+- **Submit a job**: `POST /v1/chat` → returns `job_id`; subscribe via
+  `GET /v1/jobs/:id/stream`. Resume an `ask_user`-paused job with
+  `POST /v1/jobs/:id/resume`.
+- **Drive retrieval externally**: install the `cerebrum-kb` MCP server
+  (`uv run cerebrum-kb-mcp` or via `claude mcp add`) — it exposes four
+  read tools: `kb_search`, `kb_fetch`, `kb_list_scopes`,
+  `kb_browse`. All calls go through Mother AI's auth.
+- **Add a doc**: drop a markdown file under the right wing of
+  `knowledge-hub/`, run the lint gate, and let the next ingest
+  CronJob cycle re-embed it (or run `python ingest/ingest_hub.py`
+  locally for an immediate push). Frontmatter must validate against
+  `.kb/schema/frontmatter.schema.json`.
+- **Wake Ollama before a free-model job**: `POST /v1/ollama/wake` on
+  Mother AI; the `ollama-controller` workload pings the GPU box and
+  waits for readiness before letting the worker dispatch.
+- **Operational entry points**: `scripts/demo/start_local_demo.sh`
+  spins up local stack; `scripts/cutover/cutover_manager.py` drives
+  Ortcloud cutovers; `terraform/workloads/` manages the in-cluster
+  service set.
+
+## Sources
+
+- `knowledge-hub/corporate/01_UNIVERSAL_RULES.md`
+- `knowledge-hub/corporate/02_ARCHITECTURE.md`
+- `knowledge-hub/corporate/03_REPO_INDEX.md`
+- `knowledge-hub/projects/cerebrum/components/`
+- `config/team_controls.yaml`,
+  `config/control_plane.yaml`,
+  `config/architecture_defaults.yaml`
+- `contracts/augmented_payload.schema.json`
+- `docs/` — runbooks

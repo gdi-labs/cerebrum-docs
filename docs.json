@@ -1,0 +1,42 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Cerebrum",
+  "description": "Cerebrum — a queue-first AI orchestration platform from GDI Labs.",
+  "colors": {
+    "primary": "#0D9373",
+    "light": "#22C55E",
+    "dark": "#0D9373"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction"
+            ]
+          },
+          {
+            "group": "Components",
+            "pages": [
+              "components/frontend",
+              "components/ingest",
+              "components/mcp-cerebrum-kb",
+              "components/mother-ai",
+              "components/worker"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "website": "https://gdilabs.io"
+    }
+  }
+}

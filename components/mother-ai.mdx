@@ -1,0 +1,52 @@
+---
+title: 'Repo Overview: cerebrum / Mother AI'
+description: Rust/Axum ingest service. Stateless beyond Postgres-backed projects/workflows.
+---
+
+Rust/Axum ingest service. Stateless beyond Postgres-backed projects/workflows.
+
+## What this area owns
+
+- Auth middleware (Authorization-header API token validated against team policy).
+- Request ingest, job creation, queue enqueue, and job ID lifecycle.
+- Job status API and SSE streaming for clients.
+- Projects and workflows persistence.
+- Model probing and Ollama wake-on-demand.
+- Non-LLM intent routing (rules, facts, commands).
+
+## What this area does not own
+
+- Model execution decisions.
+- RAG retrieval and context expansion implementation.
+- Multi-agent conflict resolution logic.
+- Frontend rendering or workspace provisioning.
+
+## Endpoints (in `mother-ai/src/routes.rs`)
+
+- `POST /v1/chat` — submit prompt, returns `job_id`; enqueues to Redis.
+- `GET /v1/jobs/:id` — current job status snapshot.
+- `POST /v1/jobs/:id/resume` — resume a job paused on `ask_user` interrupt.
+- `GET /v1/jobs/:id/stream` — SSE: replays Redis backlog (`cerebrum:job:{id}:events`), then streams pubsub channel (`cerebrum:job:{id}:events:ch`) until `final` or `error`.
+- `GET /v1/workflows`, `POST /v1/workflows` — workflow graph CRUD (agents, edges, prompts).
+- `GET /v1/projects`, `POST /v1/projects` — projects CRUD; persists `name`, `kind` ∈ {new, existing}, `repo_url`, `base_branch`, `created_by`, timestamps to Postgres.
+- `GET /v1/models` — list available models (local Ollama plus configured Claude / OpenAI-compatible).
+- `GET /v1/ollama/*`, `POST /v1/ollama/*` — Ollama health and wake (warms local GPU before dispatch).
+- `POST /v1/command/intents` — non-LLM intent routing.
+- `GET /healthz` — liveness.
+
+## Key implementation expectations
+
+- Ingest is stateless beyond projects/workflows persistence.
+- Queue-first invariant is enforced: every chat submission produces a Redis job before any execution.
+- Payload validation is strict and schema-driven (see `contracts/augmented_payload.schema.json` for the worker-bound payload shape).
+- Errors include job and request correlation metadata.
+- SSE handler must replay the durable backlog before joining the pubsub stream so reconnecting clients never miss events.
+
+## Relevant request patterns
+
+- "Submit prompt and track status"
+- "Stream a running job to the frontend"
+- "Create or list projects"
+- "Wake the Ollama instance before sending a free-model job"
+- "Integrate a new client channel into ingest"
+- "Add an auth policy at the API entrypoint"

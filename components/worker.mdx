@@ -1,0 +1,58 @@
+---
+title: 'Repo Overview: cerebrum / Worker Orchestrator'
+description: Python LangGraph worker. Consumes the Redis queue, augments prompts,
+  runs the L1–L4 hierarchy, dispatches to free/paid models, and streams typed events
+  back through the event bus.
+---
+
+Python LangGraph worker. Consumes the Redis queue, augments prompts, runs the L1–L4 hierarchy, dispatches to free/paid models, and streams typed events back through the event bus.
+
+## What this area owns
+
+- Queue consumption.
+- Context engine execution before routing (knowledge-hub augments + RAG retrieved context).
+- LangGraph routing and L1–L4 hierarchy execution.
+- Escalation state transitions and per-conflict retry counting.
+- Typed `AgentEvent` emission via `JobEventBus` to Redis list + pubsub channel.
+- Postgres persistence for status and audit.
+- Project workspace provisioning (clone/scaffold + Vercel deployment trigger).
+- Knowledge-hub hot-reload (refresher thread; no worker restart needed when hub files change).
+
+## What this area does not own
+
+- API ingest authentication logic.
+- Raw infrastructure provisioning modules.
+- Frontend rendering or SSE transport (worker only emits events; Mother AI streams them).
+- Contract-level protocol state transition definitions.
+
+## Key implementation expectations
+
+- Supports free and paid model dispatch with health-ranked provider fallback.
+- Free-model providers: Ollama (local/remote, including thinking models like `qwen3:14b`, `qwen3.6-27b`).
+- Paid-model providers: Claude (e.g. `claude-opus-4-7`) and OpenAI-compatible endpoints.
+- Uses RAG from Qdrant via LlamaIndex.
+- Enforces sub-job max depth (default 2).
+- Persists per-conflict `escalation_count` (max 3 retries before escalating upward).
+- L4 executor wraps token streaming with periodic heartbeats so the frontend panel stays alive on long generations.
+- Augmented payload conforms to `contracts/augmented_payload.schema.json`.
+
+## Key files
+
+- `worker/main.py` — entry point.
+- `worker/worker/graph/orchestrator.py` — LangGraph wiring (`context_node`, `routing_node`, `free_model_node`, `paid_model_node`).
+- `worker/worker/graph/agents/hierarchy.py` — L1 Team Lead, L2 managerial roles, L3 Acceptance, L4 Executor.
+- `worker/worker/graph/agents/escalation.py` — conflict retry + upward escalation.
+- `worker/worker/graph/routing.py` — policy-driven free vs paid classification.
+- `worker/worker/llm/providers.py` — Ollama, Claude, OpenAI-compatible adapters.
+- `worker/worker/llm/health.py` — provider success/failure tracking and ranking.
+- `worker/worker/rag/context_engine.py` — augmentation pipeline.
+- `worker/worker/knowledge_hub/refresher.py` — hot-reload thread.
+
+## Relevant request patterns
+
+- "Classify prompt as simple or complex"
+- "Execute L1–L4 workflow"
+- "Escalate after three failed conflict attempts"
+- "Stream tokens from L4 executor with heartbeat"
+- "Provision a project workspace and trigger a Vercel deploy"
+- "Hot-reload knowledge-hub augments without restarting workers"
