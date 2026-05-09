@@ -1,58 +1,32 @@
 ---
-title: 'Repo Overview: cerebrum / Worker Orchestrator'
-description: Python LangGraph worker. Consumes the Redis queue, augments prompts,
-  runs the L1–L4 hierarchy, dispatches to free/paid models, and streams typed events
-  back through the event bus.
+title: Worker
+description: The orchestrator. A Python LangGraph service that consumes the job queue,
+  augments prompts with retrieved context, runs the L1–L4 agent hierarchy, dispatches
+  to free or paid models, and streams typed events back through the event bus.
 ---
 
-Python LangGraph worker. Consumes the Redis queue, augments prompts, runs the L1–L4 hierarchy, dispatches to free/paid models, and streams typed events back through the event bus.
+## What it does
 
-## What this area owns
+- Pulls jobs from Redis.
+- Runs the context engine before routing — pulls knowledge-hub augments and RAG-retrieved snippets into the prompt.
+- Routes through the L1–L4 hierarchy.
+- Tracks escalation state and per-conflict retry counts.
+- Emits typed `AgentEvent` JSON to a Redis list and pubsub channel.
+- Persists status, cost, and audit trail.
+- Provisions per-project workspaces (clone, scaffold, trigger Vercel deploy).
 
-- Queue consumption.
-- Context engine execution before routing (knowledge-hub augments + RAG retrieved context).
-- LangGraph routing and L1–L4 hierarchy execution.
-- Escalation state transitions and per-conflict retry counting.
-- Typed `AgentEvent` emission via `JobEventBus` to Redis list + pubsub channel.
-- Postgres persistence for status and audit.
-- Project workspace provisioning (clone/scaffold + Vercel deployment trigger).
-- Knowledge-hub hot-reload (refresher thread; no worker restart needed when hub files change).
+## Model dispatch
 
-## What this area does not own
+Free and paid model dispatch with health-ranked provider fallback.
 
-- API ingest authentication logic.
-- Raw infrastructure provisioning modules.
-- Frontend rendering or SSE transport (worker only emits events; Mother AI streams them).
-- Contract-level protocol state transition definitions.
+- **Free providers**: Ollama (local or remote), including thinking models.
+- **Paid providers**: Claude and OpenAI-compatible endpoints.
 
-## Key implementation expectations
+A failing provider is de-preferred for subsequent jobs until its health recovers.
 
-- Supports free and paid model dispatch with health-ranked provider fallback.
-- Free-model providers: Ollama (local/remote, including thinking models like `qwen3:14b`, `qwen3.6-27b`).
-- Paid-model providers: Claude (e.g. `claude-opus-4-7`) and OpenAI-compatible endpoints.
-- Uses RAG from Qdrant via LlamaIndex.
-- Enforces sub-job max depth (default 2).
-- Persists per-conflict `escalation_count` (max 3 retries before escalating upward).
-- L4 executor wraps token streaming with periodic heartbeats so the frontend panel stays alive on long generations.
-- Augmented payload conforms to `contracts/augmented_payload.schema.json`.
+## Hierarchy invariants
 
-## Key files
-
-- `worker/main.py` — entry point.
-- `worker/worker/graph/orchestrator.py` — LangGraph wiring (`context_node`, `routing_node`, `free_model_node`, `paid_model_node`).
-- `worker/worker/graph/agents/hierarchy.py` — L1 Team Lead, L2 managerial roles, L3 Acceptance, L4 Executor.
-- `worker/worker/graph/agents/escalation.py` — conflict retry + upward escalation.
-- `worker/worker/graph/routing.py` — policy-driven free vs paid classification.
-- `worker/worker/llm/providers.py` — Ollama, Claude, OpenAI-compatible adapters.
-- `worker/worker/llm/health.py` — provider success/failure tracking and ranking.
-- `worker/worker/rag/context_engine.py` — augmentation pipeline.
-- `worker/worker/knowledge_hub/refresher.py` — hot-reload thread.
-
-## Relevant request patterns
-
-- "Classify prompt as simple or complex"
-- "Execute L1–L4 workflow"
-- "Escalate after three failed conflict attempts"
-- "Stream tokens from L4 executor with heartbeat"
-- "Provision a project workspace and trigger a Vercel deploy"
-- "Hot-reload knowledge-hub augments without restarting workers"
+- Sub-job nesting depth is capped at 2.
+- Per-conflict escalation count maxes at 3 retries before the conflict is escalated upward.
+- The L4 executor wraps token streaming with periodic heartbeats so long generations stay alive end-to-end.
+- Knowledge-hub edits hot-reload into running workers via a refresher thread — no worker restart needed.

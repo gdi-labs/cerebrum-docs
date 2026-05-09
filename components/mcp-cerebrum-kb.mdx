@@ -1,33 +1,9 @@
 ---
-title: 'Repo Overview: cerebrum / cerebrum-kb MCP server'
-description: Read-only stdio MCP server at mcp/cerebrum-kb/ that exposes the Knowledge
-  Hub to any MCP client (Claude Desktop, Claude Code, partner tools, agents) through
+title: Knowledge Hub MCP
+description: A read-only stdio MCP server that exposes the Cerebrum knowledge hub
+  to any MCP client — Claude Desktop, Claude Code, partner tools, agents — through
   a single uniform contract.
 ---
-
-Read-only stdio MCP server at
-`mcp/cerebrum-kb/` that exposes the
-Knowledge Hub to any MCP client (Claude Desktop, Claude Code,
-partner tools, agents) through a single uniform contract.
-
-## What this area owns
-
-- The four read-only MCP tools: `kb_search`, `kb_fetch`,
-  `kb_list_scope`, `kb_node`.
-- Stdio MCP wire protocol (stdin/stdout); structured logs to stderr.
-- HTTP client wrapping Mother AI's `/v1/kb/*` endpoints.
-- Per-call audit metadata (`KB_MCP_ACTOR` flows into
-  `kb_query_audit.user_id`).
-
-## What this area does not own
-
-- Auth tokens, tier filtering, or audit row writes — those are on
-  Mother AI.
-- Direct access to Qdrant or Postgres — calls always go through
-  Mother AI.
-- Write operations. Edits go through `/knowledge` (humans) or the
-  worker's diary writer (agents). Exposing `kb_edit` on the MCP wire
-  is a deliberate non-goal.
 
 ## Tools
 
@@ -35,56 +11,36 @@ partner tools, agents) through a single uniform contract.
 | --- | --- |
 | `kb_search(query, top_k?, scope_prefix?)` | Semantic search; returns chunks with `kh-id` citations. |
 | `kb_fetch(kh_id)` | Full document content + frontmatter for a stable `kh-id`. |
-| `kb_list_scope(prefix?)` | List nodes under a scope prefix; omit for full tree. |
-| `kb_node(kh_id)` | Single node + 1-hop neighbours (`related`, `derived_from`). |
+| `kb_list_scope(prefix?)` | List nodes under a scope prefix; omit for the full tree. |
+| `kb_node(kh_id)` | Single node plus 1-hop neighbours (`related`, `derived_from`). |
+
+The server is read-only by design. Writes go through the Cerebrum admin UI (humans) or the worker's diary writer (agents).
 
 ## Configuration
 
-| Env var | Required | Default | Notes |
+| Variable | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `MOTHER_AI_URL` | yes | — | e.g. `https://mother-ai.cerebrum.internal`. |
+| `MOTHER_AI_URL` | yes | — | Cerebrum Mother AI endpoint. |
 | `MOTHER_AI_API_KEY` | depends | — | Required when Mother AI has it set. |
 | `KB_MCP_ACTOR` | no | `mcp:local` | Per-client identifier in audit rows. |
 | `KB_MCP_TIMEOUT_S` | no | `20` | Upstream HTTP timeout. |
-| `KB_MCP_LOG_LEVEL` | no | `INFO` | stderr only; stdout is the MCP wire. |
+| `KB_MCP_LOG_LEVEL` | no | `INFO` | stderr only; stdout is reserved for the MCP wire. |
 
-## Key implementation expectations
-
-- **Stdout is reserved for the MCP wire protocol.** All logs and
-  diagnostics go to stderr. Polluting stdout breaks the client.
-- The server is stateless beyond the HTTP client. All state — audit
-  rows, search index, tier rules — lives in Mother AI / Qdrant /
-  Postgres.
-- Errors from Mother AI (auth, rate limit, tier-denied) flow through
-  unchanged so the client surfaces them to the user.
-- Bumps to the tool surface require coordinated changes here and in
-  the Mother AI `/v1/kb/*` handlers.
-
-## Install + wire
+## Install
 
 ```bash
 cd mcp/cerebrum-kb
 pip install -e .
 ```
 
-Wire into Claude Desktop via
-`claude_desktop_config.json` or via
-`claude mcp add cerebrum-kb --command cerebrum-kb-mcp ...` —
-see the package README for the full snippets.
+Wire into Claude Desktop via `claude_desktop_config.json`, or via Claude Code:
 
-## Key files
+```bash
+claude mcp add cerebrum-kb --command cerebrum-kb-mcp
+```
 
-- `mcp/cerebrum-kb/src/cerebrum_kb_mcp/server.py` —
-  tool definitions and stdio loop.
-- `mcp/cerebrum-kb/pyproject.toml` —
-  packaging + console script `cerebrum-kb-mcp`.
-- `mcp/cerebrum-kb/Dockerfile` —
-  containerised build for partner deployments.
+## Invariants
 
-## Relevant request patterns
-
-- "Search the hub for context on X from Claude Desktop"
-- "Fetch the full content of `kh-...` and 1-hop neighbours"
-- "List every doc under `cerebrum/components/`"
-- "Add a new read tool to the MCP surface" — this repo + Mother AI's
-  `/v1/kb/*` handler together.
+- **stdout is reserved for the MCP wire protocol.** All logs and diagnostics go to stderr. Polluting stdout breaks the client.
+- The server is stateless beyond its HTTP client. Audit rows, search index, and tier rules all live in Mother AI / Qdrant / Postgres.
+- Errors from Mother AI (auth, rate limit, tier-denied) flow through unchanged so the client can surface them to the user.

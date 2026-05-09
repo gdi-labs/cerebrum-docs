@@ -1,55 +1,25 @@
 ---
-title: 'Repo Overview: cerebrum / Knowledge Hub Ingest'
-description: Python pipeline at ingest/ that pushes the knowledge hub into Qdrant.
-  Runs locally for one-off pushes and in-cluster as the ingest-bootstrap Job / scheduled
-  CronJob.
+title: Ingest
+description: The pipeline that pushes the knowledge hub into Qdrant. Runs locally
+  for one-off pushes and in-cluster as a scheduled Job.
 ---
 
-Python pipeline at `ingest/` that pushes the
-knowledge hub into Qdrant. Runs locally for one-off pushes and
-in-cluster as the `ingest-bootstrap` Job / scheduled CronJob.
+## What it does
 
-## What this area owns
+- Reads every markdown file in the hub and parses YAML frontmatter against the hub schema.
+- Chunks each body by heading.
+- Embeds chunks via Ollama (default `nomic-embed-text`), OpenAI (`text-embedding-3-small`), or a deterministic local-hash fallback for CI.
+- Upserts chunks into Qdrant with payload indices on `kh_id`, `scope`, `scope_prefixes`, `sensitivity`, `source_type`, `team`, and `tags`.
+- Maintains a Postgres manifest so unchanged files are skipped on subsequent runs.
+- Sweeps orphans — IDs in the manifest but no longer in the hub get deleted from both Qdrant and the manifest.
 
-- Reading every `.md` file in `knowledge-hub/`, parsing its YAML
-  frontmatter against `.kb/schema/frontmatter.schema.json`.
-- Chunking the body by heading (default 1200 chars, 120 char
-  overlap).
-- Embedding via Ollama (`nomic-embed-text` by default), OpenAI
-  (`text-embedding-3-small`), or a deterministic local-hash fallback
-  for CI smoke tests.
-- Upserting chunks into Qdrant with payload indices on `kh_id`,
-  `scope`, `scope_prefixes`, `sensitivity`, `source_type`, `team`,
-  `tags`.
-- Maintaining the Postgres `kb_ingest_manifest` table so unchanged
-  files are skipped on subsequent runs.
-- Sweeping orphans — `kh_id`s in the manifest but no longer in the
-  hub get deleted from both Qdrant and the manifest.
+## Embedding providers
 
-## What this area does not own
+- **Ollama** (default): runs against a local or remote Ollama instance.
+- **OpenAI**: hosted embedding API.
+- **Hash**: deterministic local fallback for CI smoke tests; never used in production.
 
-- Retrieval / search (worker's RAG layer + Mother AI's
-  `/v1/kb/search`).
-- Frontmatter authoring or the lint gate
-  (`.kb/lint/lint_frontmatter.py` is the source-of-truth validator).
-- Diary writes from agents (worker's diary writer hits Mother AI's
-  `/v1/kb/edit`).
-
-## Key implementation expectations
-
-- **Hard-fail on embedding-provider unreachable.** Per the recent
-  fix, if the configured provider can't be reached the run aborts;
-  we do not silently fall back to the hash provider in production.
-- **Hard-fail on cluster CronJob if knowledge-hub clone fails.** The
-  init container that hydrates the hub for the in-cluster CronJob is
-  load-bearing.
-- Volatile frontmatter fields (`updated_at`, `last_synced`) are
-  excluded from the content hash so a re-sync without substantive
-  body changes does not trigger a re-embed.
-- Vector size defaults to `384`. If the embedding model dimension
-  changes, the Qdrant collection must be recreated.
-- Manifest writes are skipped under `--no-manifest` (use for first
-  runs or when Postgres is unavailable) and under `--dry-run`.
+If the configured provider can't be reached, the run aborts. There is no silent fallback in production.
 
 ## CLI
 
@@ -62,34 +32,16 @@ python ingest/ingest_hub.py
   [--dry-run]
 ```
 
-Required env (typically loaded from `ingest/.env`):
+## Configuration
 
-- `QDRANT_URL` (e.g. `http://qdrant.cerebrum.svc.cluster.local:6333`)
-- `QDRANT_API_KEY` (optional)
-- `QDRANT_COLLECTION` (default `cerebrum_knowledge_hub`)
-- `EMBEDDING_PROVIDER` ∈ {`ollama`, `openai`, `hash`} (default
-  `ollama`)
-- `OLLAMA_BASE_URL`, `OLLAMA_EMBED_MODEL` (when provider = `ollama`)
-- `OPENAI_API_KEY`, `OPENAI_EMBED_MODEL` (when provider = `openai`)
-- `POSTGRES_DSN` for manifest persistence (optional)
-- `OLLAMA_CONTROLLER_URL` (optional; lets the pipeline trigger a
-  wake before embed)
+| Variable | Purpose |
+| --- | --- |
+| `QDRANT_URL` | Qdrant endpoint. |
+| `QDRANT_API_KEY` | Qdrant auth (optional). |
+| `QDRANT_COLLECTION` | Collection name; default `cerebrum_knowledge_hub`. |
+| `EMBEDDING_PROVIDER` | One of `ollama`, `openai`, `hash`. |
+| `OLLAMA_BASE_URL`, `OLLAMA_EMBED_MODEL` | Ollama provider config. |
+| `OPENAI_API_KEY`, `OPENAI_EMBED_MODEL` | OpenAI provider config. |
+| `POSTGRES_DSN` | Manifest persistence (optional). |
 
-## Key files
-
-- `ingest/ingest_hub.py` — single
-  entry point.
-- `ingest/.env.example` — env shape.
-- `ingest/requirements.txt` —
-  pinned deps (`qdrant-client`, `pyyaml`, `requests`, `python-dotenv`,
-  `psycopg`, `jsonschema`).
-
-## Relevant request patterns
-
-- "Re-embed every doc after a schema change"
-- "Add a new payload field that the worker filters on"
-- "Why is this doc not surfacing in retrieval?" — check manifest +
-  Qdrant payload + ingest log for that `kh_id`.
-- "Wire a new connector subfolder" — the connector writes Markdown
-  with `source_type` set; the pipeline picks it up unchanged.
-- "Run an emergency full re-embed" — `--no-manifest`.
+The manifest write is skipped under `--no-manifest` (first runs, debug, or when Postgres is unavailable) and under `--dry-run`.

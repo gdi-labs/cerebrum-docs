@@ -1,52 +1,37 @@
 ---
-title: 'Repo Overview: cerebrum / Mother AI'
-description: Rust/Axum ingest service. Stateless beyond Postgres-backed projects/workflows.
+title: Mother AI
+description: The ingest service. Rust + Axum, stateless beyond Postgres-backed projects
+  and workflows.
 ---
 
-Rust/Axum ingest service. Stateless beyond Postgres-backed projects/workflows.
+## What it does
 
-## What this area owns
+- Authenticates requests via Authorization-header API tokens against team policy.
+- Persists projects and workflows.
+- Enqueues every chat submission as a Redis job before any execution — the queue-first invariant.
+- Streams job events to clients over Server-Sent Events.
+- Probes models and wakes Ollama on demand.
+- Routes non-LLM intents (rules, facts, commands).
 
-- Auth middleware (Authorization-header API token validated against team policy).
-- Request ingest, job creation, queue enqueue, and job ID lifecycle.
-- Job status API and SSE streaming for clients.
-- Projects and workflows persistence.
-- Model probing and Ollama wake-on-demand.
-- Non-LLM intent routing (rules, facts, commands).
+## Endpoints
 
-## What this area does not own
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/chat` | Submit a prompt. Returns `job_id`. |
+| `GET` | `/v1/jobs/:id` | Current job status. |
+| `POST` | `/v1/jobs/:id/resume` | Resume a job paused on an `ask_user` interrupt. |
+| `GET` | `/v1/jobs/:id/stream` | SSE: replays Redis backlog, then streams the live pubsub channel until the job finishes or errors. |
+| `GET`/`POST` | `/v1/workflows` | Workflow graph CRUD. |
+| `GET`/`POST` | `/v1/projects` | Projects CRUD. |
+| `GET` | `/v1/models` | Available models — local Ollama plus configured Claude / OpenAI-compatible. |
+| `GET`/`POST` | `/v1/ollama/*` | Ollama health and wake. |
+| `POST` | `/v1/command/intents` | Non-LLM intent routing. |
+| `GET` | `/healthz` | Liveness. |
 
-- Model execution decisions.
-- RAG retrieval and context expansion implementation.
-- Multi-agent conflict resolution logic.
-- Frontend rendering or workspace provisioning.
+## SSE invariant
 
-## Endpoints (in `mother-ai/src/routes.rs`)
+The stream handler must replay the durable backlog before joining the pubsub stream so that a reconnecting client never misses events.
 
-- `POST /v1/chat` — submit prompt, returns `job_id`; enqueues to Redis.
-- `GET /v1/jobs/:id` — current job status snapshot.
-- `POST /v1/jobs/:id/resume` — resume a job paused on `ask_user` interrupt.
-- `GET /v1/jobs/:id/stream` — SSE: replays Redis backlog (`cerebrum:job:{id}:events`), then streams pubsub channel (`cerebrum:job:{id}:events:ch`) until `final` or `error`.
-- `GET /v1/workflows`, `POST /v1/workflows` — workflow graph CRUD (agents, edges, prompts).
-- `GET /v1/projects`, `POST /v1/projects` — projects CRUD; persists `name`, `kind` ∈ {new, existing}, `repo_url`, `base_branch`, `created_by`, timestamps to Postgres.
-- `GET /v1/models` — list available models (local Ollama plus configured Claude / OpenAI-compatible).
-- `GET /v1/ollama/*`, `POST /v1/ollama/*` — Ollama health and wake (warms local GPU before dispatch).
-- `POST /v1/command/intents` — non-LLM intent routing.
-- `GET /healthz` — liveness.
+## Errors
 
-## Key implementation expectations
-
-- Ingest is stateless beyond projects/workflows persistence.
-- Queue-first invariant is enforced: every chat submission produces a Redis job before any execution.
-- Payload validation is strict and schema-driven (see `contracts/augmented_payload.schema.json` for the worker-bound payload shape).
-- Errors include job and request correlation metadata.
-- SSE handler must replay the durable backlog before joining the pubsub stream so reconnecting clients never miss events.
-
-## Relevant request patterns
-
-- "Submit prompt and track status"
-- "Stream a running job to the frontend"
-- "Create or list projects"
-- "Wake the Ollama instance before sending a free-model job"
-- "Integrate a new client channel into ingest"
-- "Add an auth policy at the API entrypoint"
+Errors include job and request correlation metadata so clients can trace any failure back to the job and the original request.
