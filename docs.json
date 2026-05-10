@@ -17,16 +17,18 @@
           {
             "group": "Get Started",
             "pages": [
-              "welcome"
+              "welcome",
+              "what-is-cerebrum",
+              "roadmap"
             ]
           },
           {
             "group": "Capabilities",
             "pages": [
               "capabilities/ai-workforce",
-              "capabilities/audit-and-cost",
               "capabilities/knowledge-grounding",
-              "capabilities/multi-model"
+              "capabilities/multi-model",
+              "capabilities/audit-and-cost"
             ]
           },
           {
@@ -50,11 +52,11 @@
           {
             "group": "Components",
             "pages": [
-              "developers/components/frontend",
-              "developers/components/ingest",
-              "developers/components/mcp-cerebrum-kb",
               "developers/components/mother-ai",
-              "developers/components/worker"
+              "developers/components/worker",
+              "developers/components/ingest",
+              "developers/components/frontend",
+              "developers/components/mcp-cerebrum-kb"
             ]
           }
         ]

@@ -1,0 +1,61 @@
+---
+title: Cerebrum roadmap
+description: Cerebrum is built as a transition, not as a finished product. Each phase
+  shifts more of the operational center from humans to AI, with humans moving up —
+  to policy, audit, and intervention — rather than out.
+---
+
+The path is five phases. Cerebrum sells the journey, not just the destination.
+
+## Guiding principles
+
+These hold across every phase. They are not aspirations; they are constraints we will not relax.
+
+- **AI writes 100% of production code.** Humans may review, veto, or override. They may not author.
+- **Everything explicit and machine-readable.** Specs, ADRs, policies, gates — all encoded, not folklore.
+- **Humans supervise systems, not tasks.** Oversight happens via dashboards, audits, and intervention triggers — not by reviewing every PR.
+- **Reversibility over autonomy.** Every AI action is traceable, reversible, and attributable. Capability without reversibility is unsafe.
+
+## The five phases
+
+### Phase 1 — Stabilize and instrument
+
+Make the existing stack such that **any AI can ship from the repo plus the docs alone.** No tribal knowledge. Every system documented. Every gate codified. The substrate is ready for AI to operate on.
+
+Milestones: complete repo documentation, automated tests, deployment runbooks, knowledge-hub grounded in real org content, the L1–L4 hierarchy in place, audit trail for every job.
+
+### Phase 2 — AI as primary developer
+
+The "no human-written code" policy goes into effect. AI produces every change. Humans approve merges and deploys; they do not write the code itself.
+
+Milestones: agent-authored PRs as the default; CI gates that enforce policy; cost tracking per merge; per-PR audit trail showing classification, plan, execution, and acceptance steps.
+
+### Phase 3 — Multi-agent role-specialized teams
+
+Agents specialize: Product, Architect, Implementation, QA, Security, Release. They critique each other's output. Humans audit periodically rather than approve continuously.
+
+Milestones: full L2 specialization deployed; adversarial review between agents (QA and Security agents review Implementation output); reduced human approval rate as agent trust builds; eval gates that auto-block regressions.
+
+### Phase 4 — AI-led planning
+
+AI plans within encoded constraints — budget, SLA, risk tolerance, compliance posture. Roadmaps, refactoring strategies, and resource allocation are AI-driven; humans set the constraints, not the plan.
+
+Milestones: policy engine that captures organizational constraints; AI-produced roadmaps reviewed (not authored) by humans; refactoring initiatives proposed and executed by AI under policy.
+
+### Phase 5 — AI governance and self-improvement
+
+The system governs itself within the policy boundary. A policy engine enforces constraints. An audit agent reviews other agents. A learning loop feeds outcomes back into the policy. Humans set high-level direction; the organization runs.
+
+Milestones: continuous policy enforcement; agents that update other agents' prompts and tools based on observed outcomes; intervention triggers fired only on exceptions; compliance posture maintained automatically.
+
+## Where we are now
+
+**Phase 1 is substantially in place.** The substrate — queue-first ingest, the L1–L4 hierarchy, knowledge-hub with sensitivity tiers, audit trail in Postgres, MCP-driven retrieval, ingest pipeline, multi-cloud deployability — is running today. Documentation is filling in.
+
+**Phase 2 is in motion.** Agents are producing real changes through the system. The "no human-written code" policy is the stated direction; we are migrating workflows toward it surface by surface.
+
+**Phase 3 has the substrate but not yet the discipline.** L2 specialization is wired (Architect, Tech Lead, Release Manager, QA, Security leads exist as agent roles). Cross-agent critique loops are present in the LangGraph orchestration. Tightening the autonomy and lowering human approval rate is the next push.
+
+**Phases 4 and 5 are ahead.** The policy engine, the audit agent, and the learning loop are the major work for the next year-plus.
+
+This is not a published delivery schedule. It is the shape of the journey. GDI Labs is the first traveler on it — we run Cerebrum on Cerebrum, which is how we discover what each phase actually demands.
