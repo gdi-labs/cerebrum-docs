@@ -2,7 +2,7 @@
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
   "name": "Cerebrum",
-  "description": "Cerebrum — a queue-first AI orchestration platform from GDI Labs.",
+  "description": "Cerebrum — an AI workforce platform from GDI Labs.",
   "colors": {
     "primary": "#0D9373",
     "light": "#22C55E",
@@ -12,22 +12,49 @@
   "navigation": {
     "tabs": [
       {
-        "tab": "Documentation",
+        "tab": "Guide",
         "groups": [
           {
             "group": "Get Started",
             "pages": [
-              "introduction"
+              "welcome"
+            ]
+          },
+          {
+            "group": "Capabilities",
+            "pages": [
+              "capabilities/ai-workforce",
+              "capabilities/audit-and-cost",
+              "capabilities/knowledge-grounding",
+              "capabilities/multi-model"
+            ]
+          },
+          {
+            "group": "How it works",
+            "pages": [
+              "how-it-works/agent-hierarchy",
+              "how-it-works/knowledge-hub"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Developers",
+        "groups": [
+          {
+            "group": "Architecture",
+            "pages": [
+              "developers/overview"
             ]
           },
           {
             "group": "Components",
             "pages": [
-              "components/frontend",
-              "components/ingest",
-              "components/mcp-cerebrum-kb",
-              "components/mother-ai",
-              "components/worker"
+              "developers/components/frontend",
+              "developers/components/ingest",
+              "developers/components/mcp-cerebrum-kb",
+              "developers/components/mother-ai",
+              "developers/components/worker"
             ]
           }
         ]

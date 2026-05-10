@@ -1,0 +1,21 @@
+---
+title: Free and paid models, together
+description: Cerebrum doesn't ask you to pick a model upfront. It picks per step,
+  balancing cost against the difficulty of the work.
+---
+
+## When free models work
+
+Routine work — classifying a prompt, drafting a plan, verifying a result — runs on free local models. They're fast, cost nothing per call, and run on your own hardware. For reasoning-heavy classification, the platform uses thinking-tuned local models.
+
+## When paid models earn their cost
+
+Architecture work, implementation, and high-risk decisions go to paid models — Claude, OpenAI, and other OpenAI-compatible endpoints. Routing is policy-driven; you decide which categories of work go where.
+
+## Fallback that just works
+
+Every paid provider has a health score. When one fails — rate limit, outage, malformed response — the platform de-prefers it for subsequent jobs and falls through to the next provider on your list. You don't need to write retry code; the platform handles it.
+
+## Per-call cost tracking
+
+Every paid call is recorded with model, token counts, and cost. You can see what each job cost, broken down by model and step. The dashboard surfaces this per project so you know exactly where spend is going.

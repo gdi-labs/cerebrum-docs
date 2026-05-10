@@ -1,0 +1,30 @@
+---
+title: The knowledge hub
+description: The knowledge hub is the organizational memory Cerebrum's agents draw
+  on. Every answer is grounded here.
+---
+
+## What lives in it
+
+- Hand-written documents.
+- Imported content from your team's existing tools (with the right connector).
+- Synthesized rollups — Q&A pairs, retrospectives, summaries.
+- Agent diary entries — decisions and reasoning captured as work happens.
+
+## How it's organized
+
+Every document has a *scope* — a path like `cerebrum/components/worker` or `your-project/overview`. Scopes form a tree: the first segment is a domain (a product, a project, a topic), and deeper segments narrow down within that domain.
+
+Agents filter retrieval by scope prefix. Asking for context "under `cerebrum/`" returns only Cerebrum-scoped documents. Asking under another project's scope returns only that project's content.
+
+## How retrieval works
+
+Documents are chunked by heading and embedded into a vector database. When an agent needs context, the platform pulls the most relevant chunks — filtered by sensitivity tier, scope, and time — and includes them in the prompt with citations back to source documents.
+
+## How content stays current
+
+- **Manual edits** through the admin surface. Edits sync to the search index within about a minute.
+- **Connector pulls** that sync from your team's other systems on a schedule.
+- **Agent diaries** that capture decisions automatically as workers execute jobs.
+
+Once a document is in the hub, every agent's next answer can use it.

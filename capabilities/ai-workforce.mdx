@@ -1,0 +1,27 @@
+---
+title: Multi-agent workforce
+description: Cerebrum runs as a team, not a single agent. Each request is classified,
+  routed to the right specialist, executed, and verified — all without you needing
+  to manage the choreography.
+---
+
+## How a request flows
+
+1. **Classify.** A fast free-model agent reads your request and decides what kind of work it is.
+2. **Plan.** A managerial agent (architect, tech lead, release manager, or a QA / security lead) sketches the approach.
+3. **Execute.** A paid-model executor produces the actual output — code, document, decision.
+4. **Verify.** An acceptance agent checks the result against the original ask. Pass/fail, with deltas.
+
+If something fails, Cerebrum retries within the same level up to three times before moving the work up to a more capable agent.
+
+## Why a team
+
+- **Specialization beats generalization.** A planning agent uses different prompts and tools than an executor. Forcing one agent to do both leaves quality on the table.
+- **The right tool for the work.** Free models handle classification and verification fast and cheap. Paid models earn their cost only on the hard problems. Cerebrum decides per step.
+- **Escalation, not retry-spam.** When a level can't resolve a conflict, the work moves up — to a more capable agent — rather than burning attempts at the same level.
+
+## What you see
+
+- A streamed view of every step. As an executor produces tokens, you see them live.
+- An audit log of every classification, escalation, and verification decision.
+- A cost breakdown per job, broken out by model.

@@ -1,0 +1,38 @@
+---
+title: The agent hierarchy
+description: Cerebrum's agents aren't a flat pool. They're organized in four levels,
+  each with a defined role.
+---
+
+## L1 — Team Lead
+
+Free-model orchestration. Reads the request, classifies it, and decides whether it's routine (stays inside free) or non-trivial (escalates to L2). Delegates work, doesn't execute it.
+
+## L2 — Managerial roles
+
+Paid-model leadership. Specializes by role:
+
+- **Architect** — system design and structural decisions.
+- **Tech Lead** — implementation plans and code-level direction.
+- **Release Manager** — deployment and rollout decisions.
+- **QA, Security, and Adversarial leads** — quality, risk, and red-team thinking.
+
+L2 doesn't execute either. It plans and routes work to L4.
+
+## L3 — Acceptance
+
+Free-model verification. Reads the executor's output and checks it against the original ask. Returns pass/fail with deltas (what's missing, what needs revision). It doesn't rewrite.
+
+## L4 — Executor
+
+Paid-model production. Specializes in file writes — emits net-new files and surgical edits — and streams tokens with periodic heartbeats so long generations stay alive end-to-end.
+
+## How escalation works
+
+Within a level, conflicts retry up to three times. After three failures, the conflict moves up — to a more capable agent — rather than burning more attempts at the same level. Sub-job nesting is capped at depth two.
+
+## Why this shape
+
+- **Free models do orchestration cheaply.** L1 (classify) and L3 (verify) don't need a paid model, and using one would waste cost.
+- **Paid models do actual work.** L2 plans, L4 builds. The hardest tokens land on the best model.
+- **Acceptance is separated from execution.** The same agent doesn't get to grade its own work.

@@ -1,0 +1,33 @@
+---
+title: Audit-ready by default
+description: Cerebrum was designed for places where you need to explain what an AI
+  did and why. Every action is recorded.
+---
+
+## What gets logged
+
+- **Every job.** Status, who submitted it, when, the classification it got, and the agents that touched it.
+- **Every escalation.** Why a conflict moved up a level and what attempt it was on.
+- **Every paid call.** Model, tokens, cost.
+- **Every retrieval.** Which knowledge-hub chunks were pulled, and what citations were produced.
+
+This sits alongside the job status, so the same query that tells you "was this successful?" also tells you "what did it cost?" and "where did the answer come from?".
+
+## Sensitivity tiers
+
+Every document in the knowledge hub carries a sensitivity tag:
+
+- **Public** — anyone can see it (the docs you're reading now).
+- **Partner** — visible to a specific partner.
+- **Internal** — visible to the team.
+- **Secret** — restricted further.
+
+Retrieval respects these tiers. A partner-facing agent only sees what's tagged public or for that partner. An internal agent sees more. Secret-tagged content is excluded from every retrieval unless explicitly allowlisted.
+
+## PII redaction
+
+PII redaction runs at two boundaries: on the way in (before a request hits a model) and on the way out of the knowledge hub (before chunks land in a prompt). The patterns are configurable per organization.
+
+## What this gives you
+
+A defensible trail. When a stakeholder asks "why did the AI do this?", you can answer with the actual classification, the actual sources, the actual decisions — not a reconstruction after the fact.

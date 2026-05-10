@@ -1,0 +1,26 @@
+---
+title: Grounded in your knowledge
+description: Every Cerebrum answer is anchored to your organization's documents, not
+  the model's generic training data. Cite-and-source is built in.
+---
+
+## The knowledge hub
+
+A library of organizational documents — product notes, project briefs, partner threads, PDFs, READMEs, hand-written guidance, and decisions agents have made along the way. Each document carries metadata:
+
+- **Scope** — where in the organization it lives (a product, a project, a team).
+- **Sensitivity** — public, partner, internal, or secret.
+- **Source** — where the content originally came from.
+- **Owner and team** — who keeps it current.
+
+## How agents use it
+
+When an agent answers, the platform pulls the most relevant chunks from the hub — filtered by sensitivity tier, scope, and recency — and includes them in the prompt. The agent answers from those chunks, with citations back to the source documents.
+
+If you ask "what's our deployment story for Project X?", you'll get an answer pulled from the actual Project X documents, with references — not a guess based on what "deployment" usually looks like.
+
+## Working with the knowledge hub
+
+- **From Claude Desktop or Claude Code.** Install the [Knowledge Hub MCP server](/developers/components/mcp-cerebrum-kb). It exposes four tools: search, fetch, list, and node-with-neighbors.
+- **From the dashboard.** The admin surface lets you edit documents directly. Edits sync to the search index within about a minute.
+- **From agents themselves.** Workers record their decisions as they happen, so today's reasoning becomes tomorrow's searchable context.
