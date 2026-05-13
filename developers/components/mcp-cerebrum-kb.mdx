@@ -1,8 +1,8 @@
 ---
 title: Knowledge Hub MCP
-description: A read-only stdio MCP server that exposes the Cerebrum knowledge hub
-  to any MCP client — Claude Desktop, Claude Code, partner tools, agents — through
-  a single uniform contract.
+description: A read-only MCP server that exposes the Cerebrum knowledge hub to any
+  MCP client — Claude Desktop, Claude Code, partner tools, agents — through a single
+  uniform contract. The same image serves three transports; choose at runtime.
 ---
 
 ## Tools
@@ -16,17 +16,43 @@ description: A read-only stdio MCP server that exposes the Cerebrum knowledge hu
 
 The server is read-only by design. Writes go through the Cerebrum admin UI (humans) or the worker's diary writer (agents).
 
+## Transport
+
+Selected at runtime by `KB_MCP_TRANSPORT`. The same binary handles all three:
+
+| Value | When to use |
+| --- | --- |
+| `stdio` (default) | Local clients — Claude Desktop, `claude mcp add`. The client execs the binary; stdio is the wire. |
+| `streamable-http` | The in-cluster deployment and any partner-tier endpoint. Spec-current MCP transport. |
+| `sse` | Older HTTP clients that don't yet speak streamable-http. |
+
+HTTP modes bind to `KB_MCP_BIND_HOST:KB_MCP_BIND_PORT` (default `0.0.0.0:8080`). When `KB_MCP_AUTH_TOKEN` is set, every HTTP request must carry `Authorization: Bearer <token>` — enforced by Starlette middleware with constant-time comparison. Leaving the token unset is correct for cluster-internal-only deployments where NetworkPolicy or ingress owns the trust boundary.
+
 ## Configuration
 
 | Variable | Required | Default | Notes |
 | --- | --- | --- | --- |
+| `KB_MCP_TRANSPORT` | no | `stdio` | `stdio` \| `streamable-http` \| `sse`. Aliases `http` and `streamable_http` accepted. |
+| `KB_MCP_BIND_HOST` | HTTP only | `0.0.0.0` | uvicorn host. |
+| `KB_MCP_BIND_PORT` | HTTP only | `8080` | uvicorn port. |
+| `KB_MCP_AUTH_TOKEN` | HTTP recommended | — | Bearer token required on `/mcp` requests when set. |
 | `MOTHER_AI_URL` | yes | — | Cerebrum Mother AI endpoint. |
 | `MOTHER_AI_API_KEY` | depends | — | Required when Mother AI has it set. |
-| `KB_MCP_ACTOR` | no | `mcp:local` | Per-client identifier in audit rows. |
+| `KB_MCP_ACTOR` | no | `mcp:local` (stdio) / `mcp:cluster` (HTTP) | Per-client identifier in audit rows. |
 | `KB_MCP_TIMEOUT_S` | no | `20` | Upstream HTTP timeout. |
-| `KB_MCP_LOG_LEVEL` | no | `INFO` | stderr only; stdout is reserved for the MCP wire. |
+| `KB_MCP_LOG_LEVEL` | no | `INFO` | stderr only on stdio; stdout is reserved for the wire. |
 
-## Install
+## Cluster deployment
+
+The `cerebrum-mcp` Terraform module (`terraform/modules/cerebrum-mcp/`) ships a Deployment + ClusterIP Service. Workers and other in-cluster tooling reach it at:
+
+```
+http://cerebrum-mcp.cerebrum.svc.cluster.local/mcp
+```
+
+A public ingress is templated but gated by `mcp_public_enabled` (default off). When enabled it attaches to the existing ingress-nginx with per-IP rate limiting; the auth token is enforced by the server middleware, not the ingress, so token rotation only touches the K8s Secret.
+
+## Local install (stdio)
 
 ```bash
 cd mcp/cerebrum-kb
@@ -41,6 +67,7 @@ claude mcp add cerebrum-kb --command cerebrum-kb-mcp
 
 ## Invariants
 
-- **stdout is reserved for the MCP wire protocol.** All logs and diagnostics go to stderr. Polluting stdout breaks the client.
+- **stdout is reserved for the MCP wire protocol on stdio transport.** All logs go to stderr.
 - The server is stateless beyond its HTTP client. Audit rows, search index, and tier rules all live in Mother AI / Qdrant / Postgres.
 - Errors from Mother AI (auth, rate limit, tier-denied) flow through unchanged so the client can surface them to the user.
+- **Auth checks use constant-time comparison.** No token-length oracle to unauthenticated callers.

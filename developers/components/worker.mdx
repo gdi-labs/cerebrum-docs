@@ -1,17 +1,17 @@
 ---
 title: Worker
 description: The orchestrator. A Python LangGraph service that consumes the job queue,
-  augments prompts with retrieved context, runs the L1–L4 agent hierarchy, dispatches
-  to free or paid models, and streams typed events back through the event bus.
+  augments prompts with retrieved context, runs every paid job through the scenario
+  runtime, dispatches to free or paid models, and streams typed events back through...
 ---
 
 ## What it does
 
 - Pulls jobs from Redis.
 - Runs the context engine before routing — pulls knowledge-hub augments and RAG-retrieved snippets into the prompt.
-- Routes through the L1–L4 hierarchy.
+- Routes paid jobs through `ScenarioOrchestrator`; see [Scenarios runtime](/developers/components/scenarios-runtime) for the engine and [Scenario execution](/how-it-works/scenario-execution) for the per-level walkthrough.
 - Tracks escalation state and per-conflict retry counts.
-- Emits typed `AgentEvent` JSON to a Redis list and pubsub channel.
+- Emits typed `AgentEvent` JSON (including the Phase-4 `level_*`, `verifier_*`, `gate_decision`, `budget_*` events) to a Redis list and pubsub channel.
 - Persists status, cost, and audit trail.
 - Provisions per-project workspaces (clone, scaffold, trigger Vercel deploy).
 

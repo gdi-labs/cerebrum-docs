@@ -1,0 +1,88 @@
+---
+title: Declarative agent flows
+description: 'Cerebrum runs every paid job through a scenario: a versioned YAML file
+  that describes the agent flow as a DAG of levels. Adding a new flow is a PR that
+  touches knowledge-hub/scenarios/; no worker deploy is required once the underlying
+  pr...'
+---
+
+## What you can express in a scenario
+
+| Concern                       | YAML field                                  |
+|------------------------------|---------------------------------------------|
+| Sequence of levels            | `levels: [...]` (ordered, ids unique)       |
+| Branching                     | `edges: [{from, to, when}]` with a typed boolean DSL |
+| Parallel children             | `kind: aggregator` + `fan_out: [...]` + `fan_in.aggregator: <name>` |
+| Human gate                    | `kind: human_approval` + `prompt_ref` + `metadata.approver_role` |
+| Per-level model pinning       | `model_constraint: { allow: ["anthropic:claude-opus-4-7"], fallback: [...], fallback_outside_allow: false }` |
+| Tier wildcards (legacy parity)| `allow: ["free:*"]` or `["paid:*"]`         |
+| Deterministic verifiers       | `verifiers: [{name: build}, {name: typecheck}, ...]` with `mode: serial \| parallel \| race` |
+| LLM-judge soft signal         | `verifiers: [{name: llm_judge, params: {rubric_ref: rigor, min_score: 0.7}, on_fail: continue}]` |
+| Budget kill switch            | `budget: {max_cost_usd, max_tokens, max_duration_s}` |
+| Schema validation             | `verifiers: [{name: schema, kind: intra, params: {schema: {...}}}]` |
+| Retry / escalate policy       | `on_fail: retry \| escalate \| continue \| abort`, `max_retries` |
+| Confidence-aware gates        | `verdict == 'PASS' && confidence >= 0.7` in an `edge.when` |
+
+## What you get for free
+
+* **Lifecycle events**: every level emits `level_started`, `level_finished`,
+  and per-verifier `verifier_started` / `verifier_finished`. Gate routing
+  emits `gate_decision`. The job UI renders all of these in the per-level
+  cards inside the job detail panel.
+* **Live cost + token telemetry**: `budget_consumed` after every model call
+  drives the live budget chip; `budget_exceeded` flips it red and aborts
+  the run.
+* **Reproducibility**: each scenario carries a `version` (semver) and a
+  `checksum` (sha256 of canonical YAML) recorded on every job's terminal
+  state.
+* **Cassette-replayed CI gate**: every PR that touches a scenario YAML or
+  the runtime modules runs the replay harness against the scenario's
+  bundled golden fixtures; the gate fails on any verifier or rubric-score
+  regression beyond `regression_thresholds`.
+* **Tenant overrides**: a Postgres-backed partial YAML deep-merges over
+  the base at orchestrator construction time, so a customer can tune
+  budgets / constraints / verifier weights without forking the base
+  scenario.
+
+## What's bundled
+
+Seven scenarios cover code, writing, research, security, and Q&A:
+
+* **`code_build`** — L1 brief → L2 plan → L4 execute → L3 build verify →
+  L3 accept. The default for paid project jobs.
+* **`code_build_strict`** — adds parallel build + typecheck + lint and an
+  llm_judge architecture-review signal on L3 accept.
+* **`document_writing`** — outline → research → draft → fact_check (JSON
+  verdict + llm_judge) → polish.
+* **`research_brief`** — decompose → fan_out[web, kb, academic] →
+  synthesis with an llm_judge rigor signal.
+* **`quick_qa`** — single free-tier level with a schema intra-verifier;
+  sub-second JSON-envelope answers.
+* **`security_review`** — triage → fan_out[semgrep, gitleaks] →
+  Opus-pinned LLM analysis → human_approval gate → final report.
+* **`parallel_review_demo`** — fan_out test scaffold; not a production
+  flow.
+
+Rubrics: `architecture_review_v1`, `fact_check_v1`, `rigor_v1`. Each
+versioned independently (`<id>_v<N>.md`), surfaced via the
+`llm_judge` verifier's `rubric_ref` param.
+
+## Authoring path
+
+1. Drop a new `<scenario_id>.yaml` under `knowledge-hub/scenarios/`.
+2. If the flow needs new prompt builders, register them in
+   `worker/worker/graph/scenarios/prompts.py`
+   via `@register_prompt_builder("<name>")`.
+3. If the flow needs a new verifier, subclass `Verifier` in
+   `worker/worker/runtime/verifiers/`
+   and register it in `builtins/__init__.py`.
+4. Capture 2-3 golden fixtures under
+   `knowledge-hub/scenarios/<scenario_id>/golden/*.json` with `input`,
+   `cassette` (recorded model responses), and `expected` verdict /
+   verifier scores.
+5. Open the PR. CI replays the fixtures and posts a verifier-score diff;
+   reviewer signs off.
+
+See [Scenario execution](/how-it-works/scenario-execution) for the
+runtime walkthrough and [Scenarios runtime](/developers/components/scenarios-runtime)
+for the module-by-module API.

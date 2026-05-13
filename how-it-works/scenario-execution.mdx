@@ -1,0 +1,221 @@
+---
+title: Scenario execution
+description: 'This document walks a single job through the scenario runtime end-to-end:
+  from the worker receiving a payload to the terminal ScenarioResult and the event
+  stream that lands on the SSE channel. It''s the companion to the API reference in
+  S...'
+---
+
+## 1. Worker dispatch
+
+The legacy `WorkerOrchestrator` is unchanged: it still routes free vs. paid
+through `routing.py` and either short-circuits to `free_model_node` or
+delegates to a single `HierarchyOrchestrator` instance. The change is
+that the field formerly named `hierarchy` is now a `ScenarioOrchestrator`
+with the same public `run(payload, routing_decision, event_bus) ->
+ScenarioResult` signature.
+
+## 2. Orchestrator construction (per-process)
+
+When the worker boots:
+
+1. `ScenarioOrchestrator.__post_init__` runs once.
+2. `register_with_existing_verifier(default_registry, build_verifier)`
+   wires the worker's pre-constructed `BuildVerifier` under the name
+   `build`.
+3. `register_llm_judge(default_registry, providers)` injects the worker's
+   `LlmProviders` instance into a fresh `LLMJudgeVerifier` factory.
+4. `ScenarioLoader(scenarios_root).load_all()` reads every
+   `knowledge-hub/scenarios/*.yaml`, validates each against the Pydantic
+   schemas, and compiles every `edge.when` clause through `expr.py`. Any
+   error fails fast with the source filename in the message.
+5. Per-tenant overrides (when the worker has been configured with a
+   `tenant_id` + `TenantOverrideProvider`) deep-merge over the base
+   scenarios.
+6. `PromptLevelRunner`, `VerifierLevelRunner`, `FanOutLevelRunner`,
+   `HumanApprovalLevelRunner` are constructed and registered with
+   `ScenarioExecutor` under their respective `kind` keys.
+7. `ScenarioCompiler(scenario, dispatcher=executor).compile()` produces a
+   LangGraph `StateGraph`. Topology rules:
+   - one node per level;
+   - edges with `when: None` become unconditional `add_edge`s;
+   - edges with a `when` clause are grouped per source and emitted as
+     `add_conditional_edges` with a router function that evaluates the
+     compiled DSL expressions in priority order and emits a
+     `gate_decision` event when a branch fires;
+   - levels with no outgoing edges implicitly route to `END`.
+
+## 3. Job invocation
+
+`run(payload, routing_decision, event_bus)` builds the initial
+`ScenarioState`:
+
+```python
+{
+  "scenario_id": ..., "scenario_version": ..., "payload": ...,
+  "routing_decision": ..., "event_bus": ...,
+  "context": compose_context(payload),       # the prompt-prepended block
+  "provider_candidates": ..., "chosen_provider": ..., "chosen_model": ...,
+  "levels": {}, "scratchpad": Scratchpad(job_id),
+  "tracker": EscalationTracker(max_attempts_per_conflict=3),
+  "escalate_now": False, "verdict": "",
+  "budget": scenario.budget, "budget_exceeded": False, "aborted_reason": None,
+  ... # aggregate cost/token counters
+}
+```
+
+Then emits `scenario_started` and invokes `compiled.invoke(initial)`.
+LangGraph drives every node from the entry point (first level by YAML
+order) until the graph reaches `END`.
+
+## 4. Level dispatch
+
+`ScenarioExecutor.run_level(state, level)` is the per-node body. It:
+
+1. Skip-fast when `state.aborted_reason` is set (budget kill switch
+   short-circuit). Returns a synthetic `skipped` level state and emits
+   `level_finished` with `ok=true, duration_ms=0`.
+2. Emits legacy `node_started` and new `level_started` (with
+   `level_id`, `role`, `kind`, `attempt`, `model_constraint_allow`).
+3. Calls the kind-specific runner.
+4. Emits `node_finished` + `level_finished` with cumulative duration,
+   cost, and the output preview (first 200 chars from the level's
+   delta).
+
+### `kind: prompt` (`PromptLevelRunner`)
+
+1. Resolves the prompt builder via `get_prompt_builder(level.prompt_ref)`
+   and builds a `BuiltPrompt`.
+2. Emits `agent_handoff` + `prompt_sent` when the builder declared them
+   (suppressed on retries by the builder itself).
+3. Resolves the model via `resolve_model(level.model_constraint, routing_default)`
+   and emits `routing_decision` with the resolved tier / provider /
+   model / `constraint_source`.
+4. Wraps the call in `event_bus.heartbeat(...)` for L4-class long
+   generations.
+5. Calls `_call_with_ask_user(...)` — same `ask_user` clarification loop
+   as the legacy hierarchy.
+6. Records cost + tokens into the running aggregates, emits
+   `budget_consumed`.
+7. Runs `state.budget` check; on exceeded, sets `aborted_reason` and
+   emits `budget_exceeded`.
+8. Per-level post-processing:
+   - `l1_brief`: `_summary_from_json` collapses the JSON envelope to a
+     readable summary stored as the level's output.
+   - `l3_accept` / `fact_check`: extract verdict from the JSON envelope,
+     write to `state.verdict`, register failure with the escalation
+     tracker on FAIL, set `escalate_now` when the budget is hit.
+   - `polish` / `synthesis` / `answer` / `l2_escalate` / `final_report`:
+     these are terminal-output levels; their result.output becomes
+     `state.final_output`.
+9. If the level itself declared verifiers (e.g., an `llm_judge` rubric on
+   `l3_accept` or `fact_check`), the runner invokes them through the
+   `VerifierRunner` and folds the per-verifier outcomes into the level
+   state alongside the prompt result.
+
+### `kind: verifier` (`VerifierLevelRunner`)
+
+1. If `level.id` is in the apply-files list (defaults to
+   `l3_build_verify`), parse the latest L4 markdown via
+   `parse_l4_markdown`, apply file blocks to disk via `apply_file_blocks`,
+   and emit a `file_created` event per file written.
+2. Build a `VerifierContext` with the project workspace, payload,
+   level output, and scratchpad.
+3. Emit `verifier_started` per declared verifier.
+4. Invoke `VerifierRunner.run(level.verifiers, ctx)`. Mode is
+   `serial`, `parallel`, or `race` (see
+   [scenarios-runtime.md][component]).
+5. Emit `verifier_finished` per result.
+6. On any failure, format the `BuildResult`-shaped error into a
+   feedback string and stash it on the scratchpad under
+   `build_feedback` so the next L4 retry picks it up. Register failure
+   with the escalation tracker on conflict id `build_failure`.
+7. Emit `build_verify_passed` or `build_verify_failed` for legacy
+   compatibility.
+
+### `kind: aggregator` (`FanOutLevelRunner`)
+
+1. Dispatches each child in `level.fan_out` through the same
+   `ScenarioExecutor` via a `ThreadPoolExecutor`. Each child runs through
+   its own kind runner (so a child can itself be `prompt`, `verifier`,
+   or `human_approval`).
+2. Merges child level states into the parent's `levels` slot so the
+   synthesis prompts can read them by id and the audit log retains every
+   child output.
+3. Hands the `ChildOutcome[]` to the aggregator named in
+   `level.fan_in.aggregator` (`majority_pass`, `weighted_score`,
+   `all_pass` by default).
+4. Sets the parent level's `output` to the aggregator's summary and
+   sets `state.verdict` to the aggregator's `PASS`/`FAIL` so the gate
+   router can branch off it.
+5. Checks the budget against the sum of children's cost (parallel
+   children each see only their own slice before the merge, so the
+   parent's post-merge check is what stops a fan_out from slipping past
+   the cap).
+
+### `kind: human_approval` (`HumanApprovalLevelRunner`)
+
+1. Builds the human-visible question via the level's `prompt_ref` builder.
+2. Emits `ask_user` with `call_id`, `interrupt_id`, `approver_role`, and
+   the level's `output_schema` (or a default `{approved, comment}`
+   schema).
+3. Calls `langgraph.types.interrupt(...)` which raises a `GraphInterrupt`
+   the worker's checkpointer catches; the run pauses until
+   `Command(resume=...)` lands.
+4. On resume, packages `{approved, comment}` into the level's
+   `output_parsed` and writes `state.verdict = PASS|FAIL`.
+5. Emits `tool_result` with the approval so the timeline shows the
+   decision landed.
+6. On reject, registers failure with the tracker under conflict
+   `human_approval:<level_id>` so a chain of rejections eventually trips
+   `escalate_now`.
+
+When the langgraph runnable context is missing (direct unit-test
+invocation outside `graph.invoke()`), the runner auto-approves with a
+loud log so the runtime stays testable without a real checkpointer.
+
+## 5. Gate routing
+
+After each level returns, LangGraph dispatches to the source's outgoing
+edges. For conditional edges:
+
+* The compiler's router evaluates each compiled expression in
+  `priority` order against a `MappingContext` built from `state`. The
+  context surfaces `verifier.<name>.<field>` from the current level's
+  verifier results, `verdict`, `escalate_now`, `confidence`,
+  `level.<id>.<field>`, and `scratchpad.<key>`.
+* The first matching edge wins. The router emits `gate_decision` with
+  `source_level`, `target_level`, `matched_expression`, and `reason`.
+* When nothing matches, the router falls through to `END` with a loud
+  log entry — scenarios should declare a default `when: None` edge to
+  avoid this.
+
+## 6. Termination
+
+When the graph reaches `END`, the orchestrator:
+
+1. Reads the terminal state and synthesizes a `ScenarioResult`
+   (output = `state.final_output` or fallback to `levels[l4_execute].output`).
+2. Emits `scenario_finished` with `status: completed | aborted`,
+   `aborted_reason`, `total_cost_usd`, `total_tokens`,
+   `total_duration_ms`, and `levels_run`.
+
+The frontend's `ScenarioRunTimeline` consumes the event stream and
+derives the per-level / per-verifier / gate / budget views via the
+helpers in `apps/frontend/lib/workflow/scenario-events.ts`. The user
+sees the full story of the run — which model ran which level, which
+verifier passed or failed with what score, which branch the gate took —
+without polling any additional endpoint.
+
+## 7. Replay path
+
+For CI / regression detection, the same pipeline runs against
+`CassetteProviders` instead of live `LlmProviders`. The cassette is a
+list of recorded `ModelCallResult` dicts on a golden fixture; every
+prompt-runner / llm_judge call pops the next entry in order. Verifier
+results are byte-for-byte deterministic (subprocess output or schema
+validation), so the replay harness can diff the run's verifier scores +
+verdict + cost against the fixture's `expected` block. The CI gate
+fails on any regression beyond declared thresholds.
+
+[component]: ../components/scenarios-runtime.md

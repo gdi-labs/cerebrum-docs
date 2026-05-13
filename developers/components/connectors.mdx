@@ -1,0 +1,253 @@
+---
+title: External-source connectors
+description: Three CronJobs pull content from sources that live outside the curated
+  hub repo and write it into the same retrieval substrate. Notion gives Cerebrum access
+  to product docs. Slack gives it conversation context. GitHub gives it raw source...
+---
+
+## Shared base
+
+Every connector subclasses `BaseConnector` (`ingest/connectors/base.py`) and implements one method:
+
+```python
+def iter_records(self, cursor: dict) -> Iterator[tuple[ConnectorRecord, dict]]:
+    """Yield (record, advanced_cursor) pairs."""
+```
+
+The base owns the rest:
+
+- **Deterministic identity** — `kh-id` is `kh-<26-char Crockford32>` derived from a stable `source_id` (SHA-256, first 16 bytes encoded). Same upstream record always yields the same id, so updates rewrite the same chunk rather than spawning duplicates.
+- **Idempotent writes** — when an existing file's canonical frontmatter + body match the new render, the write is skipped entirely. Existing `id` and `created_at` are preserved across rewrites.
+- **Cursor persistence** — the Postgres `connector_state` table (one row per connector) stores a JSON cursor so the next run picks up where this one left off.
+- **Schema-compliant frontmatter** — every emitted document validates against `knowledge-hub/.kb/schema/frontmatter.schema.json` (required fields, sensitivity enum, `source_hash` format).
+
+## Trigger model
+
+All three are time-driven CronJobs, no webhooks. The cursor does deduplication so polling often when there's nothing new is cheap.
+
+| Connector | Schedule (default) | Why this cadence |
+| --- | --- | --- |
+| `cerebrum-notion-ingest` | `0 */2 * * *` | Docs change throughout the day; 2h is fresh enough without saturating Notion's 3 req/s rate limit. |
+| `cerebrum-slack-ingest` | `*/30 * * * *` | Conversation context loses value fast; 30m keeps "what happened earlier today" answerable. |
+| `cerebrum-github-ingest` | `0 */6 * * *` | Most repos commit a handful of times per day; HEAD-SHA cursor skips the whole repo when nothing moved. |
+
+Each pod's lifecycle:
+
+1. Init container clones the curated hub into an emptyDir (same pattern as `cerebrum-hub-ingest`).
+2. Main container runs `python -m ingest.run_connector --connector <name>`.
+3. The connector writes new / changed markdown into the emptyDir under `sources/<service>/...`.
+4. The same entrypoint immediately calls `ingest_hub.reindex_paths()` on the changed files, so Qdrant has the new chunks before the pod exits.
+5. Pod exits, emptyDir wiped. Durable state lives in Postgres (cursor) and Qdrant (content).
+
+The cursor in Postgres is the source of truth for "what has been seen upstream". Files don't need to survive between pods.
+
+---
+
+## Notion connector
+
+**What it pulls**
+
+- `POST /v1/search` with `filter={object:page}` sorted descending by `last_edited_time`.
+- For each page newer than the cursor: `GET /v1/blocks/{id}/children` recursively to build the block tree.
+
+The integration token gates access. The connector sees only pages explicitly shared with the integration — that share scope is the access list.
+
+**How blocks become markdown**
+
+| Notion block | Markdown |
+| --- | --- |
+| `paragraph` | text |
+| `heading_1` / `_2` / `_3` | `## / ### / ####` (page title is `#`) |
+| `bulleted_list_item` | `- text`, children indented 2 spaces |
+| `numbered_list_item` | `1. text`, counter resets on interruption |
+| `to_do` | `- [x]` / `- [ ]` |
+| `quote`, `callout` | `> emoji text` |
+| `code` | fenced block with the language Notion stored |
+| `image`, `video`, `file`, `pdf` | `!`caption`` — internal files have URLs that expire in ~1h |
+| `bookmark`, `embed`, `link_preview` | ``url`` |
+| `child_page` / `child_database` | marker line (no recursion) |
+| `table` | real markdown table |
+| `column_list` / `column` | flattened |
+| anything else | `[unsupported block: <type>]` — visible gap |
+
+Rich-text annotations stack `code → bold → italic → strikethrough → underline` (underline renders as italic; markdown has no native underline). Links wrap the already-annotated text.
+
+**Cursor**: `{"last_edited_time": "2026-05-12T10:00:00Z"}`. Search is sorted desc, so the iterator `break`s on the first page older than the cursor.
+
+**Output**: `sources/notion/<workspace_slug>/<page-slug>.md`. Untitled pages fall back to the first 12 chars of the page id as a slug.
+
+**source_id**: `notion:page:<page-id>` — stable across edits.
+
+**Use cases**
+
+- "What did we decide about retention in the Atlas spec?" — product docs in Notion.
+- Vendor and project runbooks that don't get migrated to the curated hub.
+- OKRs, weekly reviews, meeting notes.
+
+---
+
+## Slack connector
+
+**What it pulls (per channel in the allowlist)**
+
+1. `conversations.history` with `oldest=<cursor>`, paginated via `next_cursor`. Returns messages descending by `ts`; the connector sorts ascending before yielding.
+2. For each message where `ts == thread_ts` AND `reply_count > 0`: `conversations.replies` to fetch the thread tail. Replies already in history are deduplicated by `ts`.
+
+**Day bucketing**
+
+Each Slack `ts` is converted to UTC and floored to `YYYY-MM-DD`. Messages with the same date land in one `_DayBucket`; the connector yields one record per bucket. `last_ts` per bucket — the highest `ts` in it — advances `cursor[channel_id]`.
+
+**Rewind window — `rewind_days` (default 1)**
+
+Day-files for the past N days are treated as still mutable. Each run computes `effective_oldest = min(cursor, start_of_today_utc - rewind_days)` and refetches everything in that window, then re-renders the affected day-files. This guarantees that a tick mid-day (or right after midnight) doesn't truncate today's file to "only the messages since the last tick" — without the window, every same-day rerun would have replaced today's day-file with only the new messages.
+
+The cursor still advances to the latest ts seen, so days outside the window stay immutable and aren't refetched. Bumping `rewind_days` widens the late-edit catch (Slack lets users edit messages weeks later) at the cost of one extra full-day fetch per channel per run.
+
+**Thread stitching**
+
+After all messages for a day are collected, `_stitch_threads` groups them: root messages (`ts == thread_ts`) become parents; replies (`ts != thread_ts`) attach under their parent. Each thread renders as one `## HH:MM — <topic-snippet>` heading in the day file.
+
+**Text transforms** (in order)
+
+1. **User mentions** `<@U001>` → `@<display-name>`. Resolved lazily via `users.info`, cached for the run. Unknown users render as `@U001`.
+2. **Channel mentions** `<#C111|design>` → `#design`. Falls back to `#C111` if Slack didn't include the name.
+3. **Links** `<https://x.test|label>` → `[label](https://x.test)`; bare `<https://x.test>` → `https://x.test`.
+4. `html.unescape` collapses `&amp;`, `&lt;`, etc.
+
+**Per-message rendering**
+
+```
+**@user** (HH:MM UTC) — [permalink](https://workspace/archives/CXX/pTSTS)
+
+<message text after transforms>
+
+- 📎 `filename.png`
+
+_Reactions: :rocket: ×3, :fire: ×1_
+```
+
+Permalinks use Slack's standard form (`/archives/<channel>/p<ts-no-dot>`) so any entry links back to the live thread. Files cover both `permalink` and `url_private`. Reactions are an italicized inline footer.
+
+**Per-channel policy** (`SlackChannelConfig`)
+
+Each channel carries its own `scope`, `sensitivity` (`public | partner | internal | secret`), and `tags`. So `#general` can be `internal` while `#nuts-bleu-qa` is `partner` and `#pike-tapio-launch-partners` is also `partner`.
+
+**Cursor**: `{channel_id: latest_ts_string}`. Each channel advances independently.
+
+**Output**: `sources/slack/<channel_name>/<YYYY-MM-DD>.md`.
+
+**source_id**: `slack:<channel_id>:<YYYY-MM-DD>` — same channel + same day always yields the same kh-id, so re-runs are idempotent.
+
+**Use cases**
+
+- "Why did we pick UUID v7 for the workflows table?" — the decision conversation in `#general`.
+- Async standup context: who's blocked on what, surfaced when an agent picks up a half-finished task.
+- For agents: cross-referencing diary entries with the Slack thread that triggered them — same `task_id` tag.
+
+A separate one-shot tool, `ingest/connectors/slack_backfill.py`, handles re-seeding a channel from a workspace export when bot access only landed recently. The daily-driver path is the connector above.
+
+---
+
+## GitHub connector
+
+**What it pulls**
+
+- For each repo in the allowlist: `git clone --depth 1 --branch <branch> --single-branch` into a temp dir (auth via token-in-URL when configured).
+- `git rev-parse HEAD` → current commit SHA.
+- If `cursor[<owner/repo>] == sha`: skip the whole repo. Repos that haven't moved cost one clone + one `rev-parse`.
+
+**Tree walk**
+
+`os.walk` over the cloned tree (not `pathlib.glob`, which hides dotfiles on Python 3.12 so `.git/**` exclusions would silently miss). For each file:
+
+1. Compute repo-relative posix path.
+2. Match against `exclude_globs` → skip if any match.
+3. Match against `include_globs` → skip if none match.
+4. `stat().st_size > max_file_bytes` (default 256 KB) → skip.
+5. `read_text(encoding="utf-8")` — `UnicodeDecodeError` is treated as binary and skipped.
+6. Emit a record.
+
+The glob matcher is a hand-written segment-wise recursive function so `**` means what users expect: `**/node_modules/**` correctly excludes `apps/frontend/node_modules/anything`. (`fnmatch` treats `**` as `*`, which is wrong for path globs.)
+
+**File rendering**
+
+```
+# <owner>/<repo>:<path>
+
+Source: [<path>](https://github.com/<owner>/<repo>/blob/<sha>/<path>)
+Commit: `<sha-prefix>`. Branch: `<branch>`.
+
+```<language>
+<file contents verbatim>
+```
+```
+
+Language tag is inferred from the file extension via a table covering ~30 common languages plus filename-keyed matches for `Dockerfile` and `Makefile`. Unknown extensions get an empty fence (still a valid markdown code block).
+
+**Per-repo policy** (`GitHubRepoConfig`)
+
+```json
+{
+  "owner": "gdi-labs",
+  "repo": "cerebrum",
+  "branch": "master",
+  "include_globs": ["**/*.py", "**/*.rs", "**/*.ts", "**/*.tsx", "**/*.md"],
+  "exclude_globs": [".git/**", "**/node_modules/**", "**/target/**", "**/.venv/**"],
+  "sensitivity": "internal",
+  "tags": ["self"]
+}
+```
+
+**Cursor**: `{<owner/repo>: <commit-sha>}`.
+
+**Output**: `sources/github/<owner>/<repo>/<relative-path>.md`.
+
+**source_id**: `github:<owner>/<repo>:<path>` — deliberately omits the SHA. A new commit that edits `lib.py` keeps the same source_id, so the same kh-id, so the chunk *updates* rather than spawning a duplicate. The SHA is in `source_url` for traceability but not in identity.
+
+**Use cases**
+
+- "Find the function that resolves Mother AI URLs." — literal-jargon queries where dense embeddings blur token boundaries.
+- "Where do we set the Qdrant collection name?" — config-string lookup across repos.
+- Cross-repo references: ingest `cerebrum` and `cerebrum-templates` together so workers can reason about templates while looking at how they get applied.
+- A motivating workload for the hybrid retrieval (BM25 + dense + RRF) work tracked next: identifier-style code tokens match literally, which is exactly where pure dense embeddings underperform.
+
+---
+
+## Configuration
+
+Every CronJob defaults off. Per-connector knobs live in `terraform/workloads/environments/dev/terraform.tfvars`:
+
+```hcl
+notion_enabled        = true
+notion_schedule       = "0 */2 * * *"
+notion_auth_secret_id = "cerebrum/connectors/notion"
+notion_workspace_slug = "gdi-labs"
+notion_sensitivity    = "internal"
+
+slack_connector_enabled  = true
+slack_connector_schedule = "*/30 * * * *"
+slack_auth_secret_id     = "cerebrum/connectors/slack"
+slack_workspace_host     = "gdi-labs.slack.com"
+slack_channels_json      = "[{\"id\":\"C0\",\"name\":\"general\",\"scope\":\"sources/slack/general\",\"sensitivity\":\"internal\",\"tags\":[\"company-wide\"]}]"
+
+github_connector_enabled        = true
+github_connector_schedule       = "0 */6 * * *"
+github_connector_auth_secret_id = "cerebrum/connectors/github"
+github_connector_repos_json     = "[{\"owner\":\"gdi-labs\",\"repo\":\"cerebrum\",\"branch\":\"master\", ...}]"
+```
+
+Tokens themselves never appear in tfvars — `*_auth_secret_id` points at an AWS Secrets Manager secret resolved at runtime via IRSA. Per-channel and per-repo policy ships as JSON in the env var (parsed by `ingest/run_connector.py`).
+
+## Manual trigger
+
+```bash
+kubectl -n cerebrum create job --from=cronjob/cerebrum-notion-ingest notion-once
+kubectl -n cerebrum logs job/notion-once -f
+```
+
+## Invariants
+
+- **Source-system credentials never leave AWS Secrets Manager.** The Python entrypoint resolves them at startup; no token lives in a manifest or env-fallback in production.
+- **Cursor + Qdrant carry the durable state.** A connector pod's emptyDir is wiped on exit; this is intentional. The cursor in Postgres prevents re-fetching upstream; Qdrant payload carries chunk content.
+- **Sensitivity is per-record, not per-connector.** A Slack channel can be `partner`; a GitHub repo can be `internal`; a Notion page tier is the connector default. Retrieval-time tier enforcement (when it lands) filters on this.
+- **Idempotent writes.** The same upstream record on a re-run produces the same kh-id and skips the write when content matches. Reseeding a connector is safe.

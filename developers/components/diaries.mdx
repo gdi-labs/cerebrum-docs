@@ -1,0 +1,85 @@
+---
+title: Per-agent diaries
+description: Each worker agent writes back to the knowledge hub. A diary entry is
+  a small markdown document the orchestrator emits after every task — and after every
+  task that recovered from a non-trivial error — so the agent's experience accumulates...
+---
+
+## What gets written
+
+```
+diaries/agents/<agent-id>/<YYYY-MM-DD>-<slug>.md
+```
+
+Every entry is a hub document with `source_type: diary`, so it is searchable through `kb_search`, fetchable through `kb_fetch`, and visible in the Atlas just like any curated note.
+
+Body shape:
+
+```
+# <task title>
+
+## What was done
+Route: paid_model via anthropic/claude-sonnet-4-7. Tokens: 5132. Latency: 8421ms.
+Applied 3 file operation(s).
+Build verified in 1 attempt(s).
+
+## Error encountered            (only on recovered runs)
+2 escalation(s); build repaired in 3 attempt(s)
+
+Last build stderr tail:
+error TS2345: Argument of type 'string' is not assignable to parameter of type 'number'.
+
+## How it was recovered          (only on recovered runs)
+Orchestrator engaged automatic recovery; the final attempt exited cleanly.
+
+## What was learned
+<3-5 sentence model-generated reflection — the durable signal>
+
+## Related
+- kh-...
+- kh-...
+```
+
+Tags always include `outcome:completed` or `outcome:recovered`, and `task:<task-id>` so future queries can filter on the trigger or join back to the workflow.
+
+## When the orchestrator writes one
+
+Two trigger points inside `worker/worker/orchestration/thread_runner.py`:
+
+1. **Task completion** — the success-exit path of `PromptThreadRunner.run`. One entry per successful run.
+2. **Recovered-from-error** — the same path, but flagged as recovered when any of these held during the run:
+   - `escalation_count > 0` (the model escalated)
+   - `build_verify_attempts > 1` (the build was repaired in-loop)
+   - the silent-no-op recovery (`_repair_no_files`) was triggered
+
+Failed runs **do not** write a diary. If `build_verify_passed` is false, the orchestrator treats the run as a hard gate against `commit_and_push`, and recording it as "completed" would mislead future retrieval. The diary path is also skipped if the task raises before the success path is reached.
+
+## Model-driven reflection
+
+The `What was learned` section is filled by a short LLM call (free model, `event_role="diary.reflection"`). The prompt asks for 3–5 sentences of *insight* — not a summary of what was done, which is already in the structural section above. The response is truncated at 800 characters; empty output or a model failure falls back to a deterministic stub so a diary always lands.
+
+Why a separate call: a structural summary captures *what happened*. A model reflection captures *what is non-obvious about it*. The reflection is the part that appreciates over time as retrieval surfaces it on similar future tasks.
+
+## Configuration
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `KB_DIARIES_ENABLED` | unset | When unset or falsy, the hook short-circuits before any work — no model call, no write. Flip on per environment after the runtime wiring is verified. |
+| `MOTHER_AI_URL` | — | Required when diaries are enabled; the writer POSTs to `/v1/kb/edit`. |
+| `MOTHER_AI_API_KEY` | optional | Passed as `x-api-key` if set. |
+
+## Auto-merge contract
+
+Diary entries land on the base branch immediately because `diaries/` is on the `KB_AUTO_MERGE_PREFIXES` allowlist in Mother AI (`mother-ai/src/routes.rs`). The worker's reindex consumer re-embeds the entry within a minute, so retrieval reflects it on the next query. No PR review, no manual merge.
+
+## Why this matters
+
+- An agent that recovered from a tricky build error today writes that down. The next agent looking at the same error pattern finds it through `kb_search`.
+- A pair of agents working on different parts of one workflow can read each other's reflections through the same retrieval contract — no special inter-agent channel.
+- Operators looking at "what happened on workflow X" get a chronological trail of agent-authored notes, not just a Postgres audit log.
+
+## Invariants
+
+- **A broken diary write never fails a task.** All errors are caught in the hook and logged; the surrounding job completes normally.
+- **Outcome is structural, not subjective.** The `recovered` flag fires on observable signals (escalation, build repair, no-op repair); a model can't "decide" it had a hard time.
+- **Reflection is opt-in per environment.** The same code path runs disabled by default so wiring landings can soak in dev before turning on writes.

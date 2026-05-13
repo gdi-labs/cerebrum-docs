@@ -1,0 +1,196 @@
+---
+title: Scenarios Runtime
+description: The scenarios runtime is the worker's pluggable engine for orchestrating
+  multi-step agent flows. It replaced the hardcoded L1→L2→L4→L3 LangGraph subgraph
+  (deleted in [worker/worker/graph/agents/hierarchy.py][hierarchy-removed] in May
+  202...
+---
+
+## What it enables
+
+* **Decouple agent flow shape from worker code.** New scenarios — code, writing,
+  research, security, Q&A — ship as YAML + prompt builders + (optional) rubric
+  markdown. No worker deploy required for a new flow once the relevant runners
+  exist.
+* **Per-level model pinning.** Each level resolves its own `ModelConstraint`
+  through `worker/worker/llm/resolver.py`,
+  so an L4 executor can be pinned to Claude Opus while a Q&A scenario runs the
+  whole thing on the free tier.
+* **Pluggable verifiers** (subprocess + LLM judge + schema + MCP). Verifiers can
+  run on prompt-kind levels (e.g., an `llm_judge` rubric on `l3_accept`) or on a
+  dedicated verifier-kind level that gates the next branch.
+* **First-class DAG branching.** Edges carry a typed boolean DSL
+  (`verdict == 'PASS' && !escalate_now`); the compiler evaluates them at routing
+  time. `fan_out` parents run children in parallel; aggregators (`majority_pass`,
+  `weighted_score`, `all_pass`) merge results.
+* **Human approval gates.** A `kind: human_approval` level pauses the graph via
+  LangGraph's `interrupt()`, packages a question for the approver, and resumes
+  with their reply as the gate-readable `verdict`.
+* **Budget kill switch.** Scenario-wide caps (cost / tokens / duration) fire
+  `budget_exceeded` and short-circuit subsequent levels with synthetic skipped
+  states; the run ends with `scenario_finished status="aborted"`.
+* **Per-tenant overrides.** A partial YAML stored in Postgres deep-merges over
+  the base scenario at orchestrator construction time, so an org can tweak
+  budgets / constraints / verifier weights without forking the base file.
+
+## Module layout
+
+All paths under `worker/worker/graph/scenarios/`:
+
+* `schemas.py` — Pydantic models with strict (`extra="forbid"`) validation.
+  `Scenario`, `Level`, `Edge`, `Gate`, `Budget`, `ModelConstraint`, `VerifierRef`,
+  `FanInRef`. Composite primary-key validation (unique level ids, edges target
+  existing levels or the `__end__` sentinel, mixed-tier allows rejected).
+* `state.py` — `ScenarioState` TypedDict threaded through the LangGraph. Explicit
+  top-level fields for every value the gate DSL or runners read: `verdict`,
+  `escalate_now`, `confidence`, `aborted_reason`, `budget_exceeded`,
+  per-level entries under `levels: dict[str, LevelState]`.
+* `scratchpad.py` — Redis-backed scenario-scoped KV
+  (`cerebrum:job:{job_id}:scratchpad`). Available to every level via the
+  `scratchpad.{get,put,list}` intra-tools.
+* `expr.py` — Recursive-descent parser for the edge DSL. Supports paths
+  (`verifier.build.passed`), string/number/bool literals, `==/!=/<,<=,>,>=`, `!`,
+  `&&`, `||`, parens. Missing paths resolve to a fail-closed `UNDEFINED`
+  sentinel. Loader compiles every `Edge.when` at load time.
+* `loader.py` — `ScenarioLoader` reads `*.yaml` from
+  `knowledge-hub/scenarios/`. `refresh()` swaps the
+  registry atomically and preserves the old version on any validation error.
+  `with_overrides({tenant_id: partial_yaml})` deep-merges tenant tweaks.
+  `Scenario.checksum` is the sha256 of the canonical YAML, recorded on each
+  `ScenarioResult` for reproducibility.
+* `compiler.py` — `ScenarioCompiler` turns a `Scenario` into a LangGraph
+  `StateGraph`. One node per level; non-conditional edges via `add_edge`;
+  multi-branch edges via `add_conditional_edges` with a router that evaluates
+  the edge DSL and emits `gate_decision` events.
+* `executor.py` — `ScenarioExecutor` dispatches each level to its kind-specific
+  runner. Wraps every invocation with `level_started` / `level_finished` events
+  alongside the legacy `node_started` / `node_finished` pair (back-compat through
+  one release).
+* `runners.py` — `PromptLevelRunner`, `VerifierLevelRunner`, `FanOutLevelRunner`,
+  `HumanApprovalLevelRunner`. See
+  [Scenario execution](/how-it-works/scenario-execution) for the per-runner
+  semantics.
+* `prompts.py` — Registered prompt builders for every scenario level
+  (`l1_team_lead_brief`, `writing_outline`, `security_triage`, `qa_answer`, etc.).
+  Builders return a `BuiltPrompt { body, response_kind, handoff_* }` and read
+  prior-level outputs from `state["levels"]`.
+* `aggregators.py` — `MajorityPassAggregator`, `WeightedScoreAggregator`,
+  `AllPassAggregator`. Aggregator name is referenced from the parent
+  `Level.fan_in.aggregator` field.
+* `tenant_overrides.py` — `TenantOverrideProvider` Protocol with two impls:
+  `InMemoryTenantOverrideProvider` (tests) and `PostgresTenantOverrideProvider`
+  (production). DB schema is on
+  `worker/worker/storage/postgres_repo.py`
+  under `tenant_scenario_overrides`.
+* `replay.py` — `CassetteProviders` + `ReplayHarness`. Drives a scenario through
+  recorded model responses (no live calls) and asserts no verifier or
+  rubric-score regression beyond the scenario's `regression_thresholds`. Runs in
+  CI via `.github/workflows/scenario-replay.yml`.
+* `orchestrator.py` — `ScenarioOrchestrator` is the public entry the worker calls.
+  Same `run(payload, routing_decision, event_bus) -> ScenarioResult` contract the
+  legacy `HierarchyOrchestrator` exposed.
+
+The verifier framework lives at
+`worker/worker/runtime/verifiers/`
+and is consumed by both `PromptLevelRunner` (when a prompt level declares
+verifiers) and `VerifierLevelRunner`. Built-ins: `build` (subprocess install +
+build), `typecheck`, `lint`, `unit_test`, `schema` (JSON Schema + Pydantic),
+`llm_judge` (rubric-scored), `semgrep`, `gitleaks`.
+
+## Lifecycle events
+
+Worker emits both the legacy and the Phase-4 lifecycle events for one release.
+Frontend renders the new events via
+`apps/frontend/components/workflow/scenario-run-timeline.tsx`.
+
+| Event kind          | Payload highlights                                    |
+|---------------------|-------------------------------------------------------|
+| `scenario_started`  | `scenario_id`, `scenario_version`                     |
+| `scenario_finished` | `status: completed \| aborted`, `aborted_reason`, totals |
+| `level_started`     | `level_id`, `role`, `kind`, `attempt`, `model_constraint_allow` |
+| `level_finished`    | `ok`, `attempt`, `duration_ms`, `cost_usd`, `output_preview` |
+| `verifier_started`  | `level_id`, `verifier_name`, `kind`                   |
+| `verifier_finished` | `passed`, `score`, `reasons`, `cost_usd`, `duration_ms` |
+| `gate_decision`     | `source_level`, `target_level`, `matched_expression` |
+| `budget_consumed`   | cumulative `total_cost_usd`, `total_tokens`, `total_duration_ms` |
+| `budget_exceeded`   | `limit_kind`, `limit_value`, `observed_value`         |
+
+Payloads contracts in
+`worker/worker/runtime/agent_messages.py`.
+TypeScript mirror in
+`apps/frontend/lib/types/agent-event.ts`.
+
+## Bundled scenarios
+
+| Scenario              | Domain    | Special primitive |
+|-----------------------|-----------|-------------------|
+| `code_build`          | code      | Build verifier; L4 pinned paid |
+| `code_build_strict`   | code      | Parallel build/typecheck/lint + llm_judge architecture |
+| `document_writing`    | writing   | Editorial chain + fact-check judge |
+| `research_brief`      | research  | fan_out[web, kb, academic] + rigor judge |
+| `quick_qa`            | qa        | Single-level + schema intra-verifier |
+| `security_review`     | security  | human_approval gate + semgrep/gitleaks |
+| `parallel_review_demo`| demo      | (test scaffold for fan_out) |
+
+Rubrics live alongside scenarios in
+`knowledge-hub/rubrics/`:
+`architecture_review_v1`, `fact_check_v1`, `rigor_v1`.
+
+## CI gate
+
+`.github/workflows/scenario-replay.yml`
+runs on every PR touching `knowledge-hub/scenarios/**`,
+`knowledge-hub/rubrics/**`, or `worker/worker/graph/scenarios/**`. It loads each
+scenario's golden fixtures from
+`knowledge-hub/scenarios/<id>/golden/*.json` and replays them through
+`ReplayHarness` against `CassetteProviders`. The job fails on any verifier or
+rubric regression beyond declared thresholds.
+
+## Impact scope
+
+* **Worker**: hot path for every paid job goes through `ScenarioOrchestrator`.
+  Legacy `HierarchyOrchestrator` is deleted; the wrapping
+  `WorkerOrchestrator` is unchanged.
+* **Frontend**: `JobDetailPanel` mounts `ScenarioRunTimeline` for every job.
+  Renders nothing on legacy backlog events for backwards compat.
+* **Postgres**: one new table `tenant_scenario_overrides` (composite PK on
+  `tenant_id, scenario_id`).
+* **Defaults**: `code_build` is the default scenario; override via the
+  `CEREBRUM_DEFAULT_SCENARIO` env var or per-job `scenario_id` metadata.
+* **Backwards compat**: legacy `node_started` / `node_finished` events still
+  fire alongside the new `level_*` events for one release.
+
+## Tests
+
+All tests live at repo root `tests/`. The scenario runtime suite:
+
+* `test_scenarios.py` (28) — schemas, loader, scratchpad.
+* `test_scenario_expr.py` (25) — gate DSL.
+* `test_verifiers.py` + `test_verifiers_phase2.py` (55) — verifier framework +
+  built-ins.
+* `test_scenario_compiler.py` (10) — compiler topology + end-to-end with mock
+  runners.
+* `test_scenario_prompts.py` (10) — prompt-builder parity.
+* `test_scenario_orchestrator.py` (9) — production orchestrator with fake
+  providers.
+* `test_scenario_events.py` (13) — Phase-4 lifecycle event payloads.
+* `test_scenario_phase5.py` (12) — fan_out + aggregators + budget kill switch.
+* `test_scenario_phase6.py` (16) — checksum, hot-reload, tenant overrides,
+  replay harness.
+* `test_tenant_overrides.py` (12) — DB-backed tenant overrides.
+* `test_model_resolver.py` (15) — per-level model pinning.
+* `test_document_writing.py` (15), `test_quick_qa_and_research_brief.py` (12),
+  `test_security_review.py` (15) — bundled scenarios end-to-end.
+
+Run from repo root with the worker venv:
+
+```bash
+/Users/azat/labs/cerebrum/worker/.venv/bin/python -m pytest tests/ -v
+```
+
+Suite status as of 2026-05-13: 502 passing, 9 unrelated pre-existing failures
+(`test_provider_registry.py`, `test_scheduler_producer.py`,
+`test_context_engine.py` — all `WorkerConfig.__init__` drift not introduced by
+the scenario work).
+
+[hierarchy-removed]: ../../../../worker/worker/graph/agents/

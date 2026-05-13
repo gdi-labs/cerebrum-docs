@@ -1,8 +1,11 @@
 ---
 title: The agent hierarchy
-description: Cerebrum's agents aren't a flat pool. They're organized in four levels,
-  each with a defined role.
+description: '> Implementation note (2026-05-13). The L1/L2/L3/L4 split below > remains
+  the conceptual shape of code-build runs but is no longer > hardcoded in the worker.
+  Every flow — code, writing, research, > security, Q&A — is now a versioned YAML...'
 ---
+
+Cerebrum's agents aren't a flat pool. They're organized in four levels, each with a defined role.
 
 ## L1 — Team Lead
 
@@ -36,3 +39,20 @@ Within a level, conflicts retry up to three times. After three failures, the con
 - **Free models do orchestration cheaply.** L1 (classify) and L3 (verify) don't need a paid model, and using one would waste cost.
 - **Paid models do actual work.** L2 plans, L4 builds. The hardest tokens land on the best model.
 - **Acceptance is separated from execution.** The same agent doesn't get to grade its own work.
+
+## Beyond code
+
+The L1/L2/L3/L4 shape suits *code* flows. Non-code flows aren't shaped
+the same way:
+
+- **`document_writing`** is an editorial chain (outline → research →
+  draft → fact_check → polish).
+- **`research_brief`** is a fan_out across specialist subdomains (web,
+  internal KB, academic) joined by a synthesis level.
+- **`security_review`** is a triage + parallel static scans + LLM
+  analyst + human approval + final report pipeline.
+- **`quick_qa`** is a single free-tier level with a schema verifier.
+
+These all run on the same scenario engine. The L1/L2/L3/L4 layering
+remains the *default convention* for `code_build` and
+`code_build_strict`; everything else picks its own level ids.

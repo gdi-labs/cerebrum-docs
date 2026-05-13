@@ -28,14 +28,16 @@
               "capabilities/ai-workforce",
               "capabilities/knowledge-grounding",
               "capabilities/multi-model",
-              "capabilities/audit-and-cost"
+              "capabilities/audit-and-cost",
+              "capabilities/declarative-agent-flows"
             ]
           },
           {
             "group": "How it works",
             "pages": [
               "how-it-works/agent-hierarchy",
-              "how-it-works/knowledge-hub"
+              "how-it-works/knowledge-hub",
+              "how-it-works/scenario-execution"
             ]
           }
         ]
@@ -56,7 +58,10 @@
               "developers/components/worker",
               "developers/components/ingest",
               "developers/components/frontend",
-              "developers/components/mcp-cerebrum-kb"
+              "developers/components/mcp-cerebrum-kb",
+              "developers/components/connectors",
+              "developers/components/diaries",
+              "developers/components/scenarios-runtime"
             ]
           }
         ]
