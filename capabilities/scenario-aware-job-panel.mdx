@@ -1,0 +1,74 @@
+---
+title: Scenario-Aware Job Output Panel
+description: The workflow detail panel renders model output per scenario. Quick-QA
+  jobs no longer dump their JSON envelope as raw text under a "Project output" header
+  — the answer renders as a card with a confidence pill and a sources list. Markdown...
+---
+
+## What it enables
+
+- **Right-shaped output for every scenario.** Per-job dispatch (commit `04147e9`) made the panel polyglot in *what* it shows but not yet in *how*. This change closes that loop: each scenario's terminal output renders in a layout fitting its shape, instead of the code-build-shaped default.
+- **First-class `scenario_id` on the wire.** Both `JobStatusResponse` and `PromptThreadStatusResponse` now expose `scenario_id` so any future per-scenario UI (timeline labels, filters, list badges) can switch on a typed enum rather than fishing inside `audit_log`.
+- **Backwards-compatible.** Jobs created before the column existed fall back to a server-side audit-log extraction (so the UI still discriminates correctly), and unknown scenario_ids fall through to the existing Markdown renderer (no regression on ad-hoc / future scenarios).
+
+## What's changed
+
+**Backend — Postgres + worker**
+
+- `worker/worker/storage/postgres_repo.py`: additive migration on `ensure_schema()` — `alter table job_runs add column if not exists scenario_id text`. The `save_result` upsert writes the new column on every persist.
+- `worker/worker/models.py`: `JobExecutionResult.scenario_id: str | None = None`.
+- `worker/worker/orchestration/integration.py`: `IntegrationProcessor.save_result` accepts and forwards `scenario_id`.
+- `worker/worker/main.py`:
+  - Success path passes `scenario_id=run_result.scenario_id or None` (the field already lived on `ScenarioResult`).
+  - Failure path falls back to `job.metadata.get("scenario_id")` so failed jobs still record which scenario they were trying to run.
+
+**Backend — mother-ai (Rust)**
+
+- `mother-ai/src/models.rs`:
+  - `JobStatusResponse` adds `pub scenario_id: Option<String>`.
+  - `PromptThreadStatusResponse` adds `pub scenario_id: Option<String>` (the FE renders per-prompt outputs, so the per-prompt scenario is the one that matters).
+- `mother-ai/src/routes.rs`:
+  - `JobStatusFromPostgres` carries `scenario_id`; `fetch_job_from_postgres` selects it and falls back via the new `extract_scenario_id(audit_log)` helper for jobs created before the column existed.
+  - `fetch_prompts_from_postgres` adds a correlated subquery for the latest `job_runs.scenario_id` per `prompt_id`, falls back to `prompt_threads.metadata.scenario_id` (the request-time pin) when the joined value is null.
+
+**Frontend**
+
+- `apps/frontend/lib/schemas.ts`: new `scenarioIdSchema = z.enum([...])` + `ScenarioId` type. Added to both `jobStatusResponseSchema` and `promptThreadStatusResponseSchema`.
+- `apps/frontend/components/workflow/panels/scenario-output-renderer.tsx` (new): switches on `scenarioId`. `quick_qa` parses the JSON envelope (zod `safeParse`) and renders an answer card + confidence pill + sources list, falling through to Markdown if the shape doesn't match. Markdown scenarios (`document_writing`, `research_brief`, `security_review`, `code_build`) render via the existing `react-markdown` + `remark-gfm` stack (no new deps).
+- `apps/frontend/components/workflow/editor/prompt-threads-list.tsx`: the per-prompt `ThreadResponseOutput` now reads `scenarioId` off the thread record and routes to `ScenarioOutputRenderer`. Threads without a `scenarioId` (older runs, ad-hoc scenarios) keep the legacy Markdown pass-through — no regression.
+
+## Impact scope
+
+- **Additive across the stack.** No existing callers break; the Rust struct fields are `Option<String>` with `skip_serializing_if = "Option::is_none"`, the FE zod schema is `optional()`, and unknown scenarios fall through to the legacy Markdown renderer. A worker can persist new rows immediately after the migration runs (the `alter table` is idempotent and runs on every `ensure_schema()`).
+- **No new FE dependencies.** Reuses the existing `react-markdown ^10.1.0` + `remark-gfm ^4.0.1` already pinned for `task-output-modal.tsx`, `markdown-editor.tsx`, and the same `prompt-threads-list.tsx` reasoning rendering.
+- **Production URL block needs no gating.** The "LIVE" / `production_url` block in `job-detail-panel.tsx` is conditional on `productionUrl` being non-empty; non-code scenarios never set that metadata key, so the block already hides for them.
+- **Backfill window.** Jobs created before the column existed have `scenario_id = NULL` in `job_runs`; the Rust handler's `extract_scenario_id` helper recovers the value from `audit_log.events[*].payload.scenario_id` (where the orchestrator emits it) so the FE still discriminates correctly during the rollout window.
+
+## Tests
+
+- **Worker:** `tests/test_tool_loop_runner.py` and the rest of the worker pytest suite still pass (592 tests; 9 pre-existing failures on master are unrelated).
+- **Mother-ai:** `cargo test --offline` — 12 tests pass.
+- **Frontend:** `npx --no-install tsc --noEmit` and `pnpm run lint` (biome) both clean. The FE has no test runner configured today, so the renderer is verified by type-check + manual UI smoke (fire one job per scenario from the composer and confirm the panel renders the right shape).
+
+Manual verification:
+
+```bash
+# Backend
+cd /Users/azat/labs/cerebrum/mother-ai && cargo check && cargo test
+# Apply the migration on dev (idempotent — the worker runs ensure_schema on boot).
+kubectl rollout restart deploy/cerebrum-worker -n cerebrum
+kubectl rollout restart deploy/mother-ai -n cerebrum
+
+# Frontend
+cd /Users/azat/labs/cerebrum/apps/frontend
+npx --no-install tsc --noEmit
+pnpm run lint
+pnpm dev
+```
+
+In the UI, fire one job per scenario from the workflow composer:
+
+- `quick_qa` → answer card with a confidence pill (`data-testid="confidence-pill"`) and source list.
+- `document_writing` / `research_brief` / `security_review` → Markdown renders (headings, lists, tables).
+- `code_build` → Markdown summary + (when `production_url` is in metadata) the LIVE block in the panel header.
+- A workflow whose threads have no `scenario_id` (e.g. a job created before the rollout) → falls through to the existing Markdown pass-through.

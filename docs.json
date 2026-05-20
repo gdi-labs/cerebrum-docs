@@ -29,7 +29,11 @@
               "capabilities/knowledge-grounding",
               "capabilities/multi-model",
               "capabilities/audit-and-cost",
-              "capabilities/declarative-agent-flows"
+              "capabilities/aws-pulse-report",
+              "capabilities/declarative-agent-flows",
+              "capabilities/hide-workflow",
+              "capabilities/scenario-aware-job-panel",
+              "capabilities/universal-input"
             ]
           },
           {
@@ -37,6 +41,7 @@
             "pages": [
               "how-it-works/agent-hierarchy",
               "how-it-works/knowledge-hub",
+              "how-it-works/project-slug-identity",
               "how-it-works/scenario-execution"
             ]
           }
@@ -59,8 +64,13 @@
               "developers/components/ingest",
               "developers/components/frontend",
               "developers/components/mcp-cerebrum-kb",
+              "developers/components/agent-workbench",
               "developers/components/connectors",
               "developers/components/diaries",
+              "developers/components/external-tools-platform",
+              "developers/components/intent-classifier",
+              "developers/components/job-telemetry",
+              "developers/components/l4-ask-user",
               "developers/components/scenarios-runtime"
             ]
           }

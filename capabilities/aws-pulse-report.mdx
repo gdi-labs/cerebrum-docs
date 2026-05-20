@@ -1,0 +1,75 @@
+---
+title: AWS Pulse Report
+description: A daily-cadence operations scenario that audits an AWS account via read-only
+  API calls, synthesizes a Markdown summary, and posts a Block Kit version to Slack
+  — end-to-end, with no human in the loop.
+---
+
+It's the first scenario built on the [external-tools platform](/developers/components/external-tools-platform):
+all twelve AWS calls and the Slack publish run through the new
+`tools/` registry, not the workspace file tools.
+
+## What it enables
+
+- One-command (or scheduled) AWS audit: compute footprint, storage
+  hygiene, IAM key/MFA gaps, network exposure, cost movers, RDS
+  posture, and CloudTrail coverage — all in a single run.
+- A consistent, narrated artifact (Markdown + Slack Block Kit) that
+  the team can read in 30 seconds instead of clicking through ten
+  console tabs.
+- Graceful degradation when Cost Explorer or Compute Optimizer aren't
+  enabled: those tools surface `OptInRequired` as a clean
+  `ToolResult(ok=False)` and the loop continues with the remaining
+  signals.
+- A blueprint for future ops scenarios (Incident Response, Lead
+  Qualifier, Vendor Audit) that need the same connector pattern.
+
+## What's changed
+
+- New scenario YAML: `knowledge-hub/scenarios/aws_pulse_report.yaml`
+  with three levels — `collect` (tool_loop), `synthesize` (prompt),
+  `publish` (tool_loop) — wired by `intent_routes: [aws_pulse,
+  aws_audit, cloud_audit, aws_cost, aws_security]`.
+- Three new prompt builders in `worker/worker/graph/scenarios/prompts.py`:
+  `aws_pulse_collect`, `aws_pulse_synthesize`, `aws_pulse_publish`.
+- CLI smoke runner: `python -m worker.scripts.run_scenario aws_pulse_report`.
+  Routes through the real `LlmProviders` + `EnvToolSecretProvider`;
+  prints the final Markdown body and a compact JSON tail.
+
+## Impact scope
+
+- Pure addition. Doesn't touch the file-tool dispatch path; existing
+  `code_build` / `document_writing` / `quick_qa` runs are unaffected.
+- Requires per-tenant `aws_default` and `slack_bot` secrets seeded via
+  `python -m worker.scripts.seed_tool_secret` (see the
+  [external-tools-platform doc](/developers/components/external-tools-platform#tenant-secrets) for shape).
+- Defaults to off — only fires on jobs that carry one of the declared
+  intent routes.
+- Cost-bounded by the scenario budget (`max_cost_usd: 2.50`,
+  `max_duration_s: 600`).
+- Cost Explorer + Compute Optimizer enablement on the AWS account is
+  optional; gated tools degrade gracefully.
+
+## Tests
+
+- Load test: every `prompt_ref` resolves to a registered builder;
+  every `intra_tools` name is in the registry; intent routes index
+  back to this scenario.
+- End-to-end integration test: drives the production
+  `ScenarioOrchestrator` with a scripted `FakeProviders` queue,
+  `botocore.stub.Stubber` for AWS, and `httpx.MockTransport` for
+  Slack. Covers the happy path and the OptInRequired graceful path.
+
+Run:
+
+```bash
+worker/.venv/bin/python -m pytest \
+  tests/test_scenario_aws_pulse_load.py \
+  tests/test_scenario_aws_pulse.py -v
+```
+
+Live smoke (manual, no Slack post — read-only AWS only):
+
+```bash
+RUN_LIVE=1 worker/.venv/bin/python -m pytest tests/test_aws_pulse_live.py -v
+```

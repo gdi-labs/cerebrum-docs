@@ -1,0 +1,181 @@
+---
+title: External Tools Platform
+description: A registry + dispatch layer that lets scenarios call out to remote services
+  (AWS, Slack, future REST connectors) alongside the existing workspace file tools.
+  Lives at worker/worker/runtime/tools/.
+---
+
+## What it enables
+
+- Operations-shaped scenarios (AWS Pulse, Incident Response, Lead
+  Qualifier) that need to read live state from outside the project
+  workspace.
+- Per-tenant credential management with an audit-friendly indirection:
+  the database holds a *reference* to the secret, never the secret
+  value itself.
+- Per-scenario tool whitelisting via the previously-unused
+  `Level.intra_tools` field — a typo surfaces as a clear `KeyError`
+  at level start, not a silent miss.
+- Shared HTTP plumbing (retry, per-host rate limit, structured
+  logging) so each connector doesn't reinvent it.
+
+## Architecture
+
+```
+worker/worker/runtime/tools/
+  base.py          # ToolSpec, ToolContext, ToolHandler
+  registry.py      # ToolRegistry (mirrors VerifierRegistry)
+  http.py          # HttpClient — thin httpx wrapper, retry + rate-limit
+  secrets.py       # EnvToolSecretProvider + SecretsManager stub (Phase 2)
+  errors.py        # normalize_exc — botocore + httpx → ToolResult(ok=False)
+  builtins/
+    aws/           # 12 read-only audit tools (compute, cost, storage, …)
+    slack/         # 4 tools (3 post variants + channel history)
+```
+
+**Two-registry topology.** File tools (`finish`, `read_file`, `edit_file`,
+…) stay in `worker/runtime/file_tools.py`; external tools live in this
+new registry. They're layered together at dispatch time — file tools
+are always available; external tools come from `Level.intra_tools`.
+This separation is deliberate: file tools take a project workspace and
+mutate the tree; external tools take a `ToolContext` (tenant + secrets
++ HTTP) and reach out to remote services. Forcing one signature would
+compromise both.
+
+## Tool definition pattern
+
+```python
+EC2_INVENTORY_SPEC = ToolSpec(
+    name="aws_ec2_inventory",
+    description="...",
+    input_schema={"type": "object", "properties": {...}},
+    handler=_ec2_inventory,
+    tags=("aws", "ec2", "read_only"),
+    requires_secrets=("aws_default",),
+)
+
+def _ec2_inventory(ctx: ToolContext, args: dict) -> ToolResult:
+    try:
+        session = build_boto3_session(ctx, region=args.get("region"))
+        # ...
+        return ToolResult(ok=True, value={...})
+    except Exception as exc:
+        return normalize_exc("aws_ec2_inventory", exc)
+```
+
+Connector packages call `default_registry.register(SPEC)` at import
+time. `tools/__init__.py` pulls in `builtins` for the side-effect, so
+a single `from worker.worker.runtime.tools import default_registry`
+exposes every shipped tool.
+
+## Tenant secrets
+
+Schema: `tenant_tool_secrets` (added to `PostgresRepo.ensure_schema`).
+
+| Column | Notes |
+|---|---|
+| `tenant_id`, `secret_name` | Composite PK |
+| `ref_kind` | `'env'` (Phase 1), `'secrets_manager'`, `'inline'` (Phase 2+) |
+| `ref_value` | Env var name OR Secrets Manager ARN OR encrypted blob id |
+| `metadata`, `notes`, `created_by`, timestamps | Audit trail |
+
+Phase 1 only resolves `ref_kind='env'`. `EnvToolSecretProvider` reads
+the row, looks up `os.environ[row['ref_value']]`, JSON-parses if the
+payload looks like JSON, falls back to `{"value": <raw>}`. A 300s
+in-process TTL cache absorbs repeat lookups within a single run.
+
+Seed a row:
+
+```bash
+python -m worker.scripts.seed_tool_secret \
+  --tenant default \
+  --secret-name aws_default \
+  --ref-kind env \
+  --ref-value CEREBRUM_AWS_DEFAULT
+```
+
+…then set `CEREBRUM_AWS_DEFAULT='{"access_key_id":"...","secret_access_key":"...","region":"ap-east-1"}'`.
+
+`SecretsManagerToolProvider` is a stub that raises `NotImplementedError`
+loudly so a premature switch in Phase 2 is loud, not silent.
+
+## Runner integration
+
+Two surgical edits in
+`worker/worker/graph/scenarios/runners.py`:
+
+1. `_build_tool_list(level, registry)` — combined file + external tool
+   schema list per level. Unknown `intra_tools` raises at level start
+   with the full list of registered names.
+2. `_dispatch_tool` — registry-aware: `ask_user` (interrupt) →
+   external tool registry → file tool `execute_tool` fallthrough.
+   Crashes in external handlers become `ToolResult(ok=False)`; they
+   never abort the loop.
+
+Tool-call / tool-result events on the SSE bus are passed through
+`_redact()` — any string under a key matching
+`/(secret|token|password|api[_-]?key|access[_-]?key)/i` is masked to
+`<redacted>`. Belt-and-braces in case a token leaks into args.
+
+Workspace-less levels (AWS Pulse style — `intra_tools` set, no
+`_project_cwd`) get a scratch `tempfile.TemporaryDirectory` so
+`finish` still works.
+
+## Shipped connectors
+
+**AWS — 12 read-only audit tools.** `aws_ec2_inventory`,
+`aws_ebs_inventory`, `aws_cost_breakdown`, `aws_cost_anomalies`,
+`aws_compute_optimizer_recs`, `aws_s3_inventory`, `aws_iam_audit`,
+`aws_security_groups_audit`, `aws_cloudtrail_coverage`,
+`aws_nat_gateways_audit`, `aws_eips_audit`, `aws_rds_inventory`.
+Cost Explorer / Compute Optimizer require account opt-in;
+`OptInRequired` surfaces as `ToolResult(ok=False, error=…)` so the
+loop continues.
+
+**Slack — 4 tools.** `slack_post_message`, `slack_post_blocks`,
+`slack_post_threaded`, `slack_channel_history`. Auth resolves either
+a `bot_token` (`xoxb-…`) for the full Web API or a `webhook_url` for
+post-only delivery; bot token wins when both are present.
+
+## Impact scope
+
+- Pure addition. Existing scenarios (`code_build`, `document_writing`,
+  `quick_qa`, `security_review`) are unaffected — file tools dispatch
+  unchanged. A legacy `intra_tools: [heartbeat_l4]` declaration in
+  `code_build.yaml` works because we registered a no-op sentinel.
+- New Postgres table; `ensure_schema()` is idempotent.
+- Production wiring lives in `worker/worker/main.py`: builds one
+  `EnvToolSecretProvider(repo=postgres)` and passes it to
+  `WorkerOrchestrator`.
+- New dependencies: none. Uses existing `httpx`, `boto3`, `psycopg`.
+
+## Tests
+
+| File | Coverage |
+|---|---|
+| `test_tool_registry.py` | Register/get/clone/duplicate, helpful KeyError |
+| `test_tool_http_client.py` | Retry on 5xx, Retry-After, idempotent=False, token bucket |
+| `test_tool_secrets.py` | Env resolution, convention fallback, TTL cache |
+| `test_runners_external_tools.py` | `_build_tool_list`, dispatch, redaction |
+| `test_tools_aws.py` | One happy + one error path per AWS tool (botocore.stub) |
+| `test_tools_slack.py` | Bot vs webhook routing, Block Kit limits, errors |
+| `test_scenario_aws_pulse_load.py` | YAML parses, prompt_refs resolve, intra_tools registered |
+| `test_scenario_aws_pulse.py` | End-to-end orchestrator with stubbed AWS + Slack |
+
+Run:
+
+```bash
+worker/.venv/bin/python -m pytest \
+  tests/test_tool_registry.py tests/test_tool_http_client.py \
+  tests/test_tool_secrets.py tests/test_runners_external_tools.py \
+  tests/test_tools_aws.py tests/test_tools_slack.py \
+  tests/test_scenario_aws_pulse_load.py tests/test_scenario_aws_pulse.py -v
+```
+
+## Phase 2 plans
+
+- Real `SecretsManagerToolProvider` backing (currently stubbed).
+- Cross-tenant AWS via `sts:AssumeRole`.
+- More connectors: GitHub, PagerDuty, CRM (Attio / HubSpot), ATS
+  (Greenhouse / Lever).
+- Admin UI for per-tenant secret seeding (currently CLI-only).

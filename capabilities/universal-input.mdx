@@ -1,0 +1,142 @@
+---
+title: Universal Task Input
+description: '## What it enables'
+---
+
+A single **Task** input that accepts any free-text prompt and
+auto-routes it to the right scenario based on content. The user no
+longer picks a category card to match their intent — they type, and
+the worker's intent_classifier scenario figures out whether the prompt
+is an AWS audit, a code build, a Q&A, a research brief, or something
+else. When the classifier isn't confident enough, it surfaces the top
+candidates as a button panel inside the task modal so the user can
+disambiguate with one click.
+
+Outcomes:
+- Faster prompt-to-result loop — no cognitive cost of guessing the
+  right card.
+- The scenario library grows without bloating the command widget. New
+  specialized scenarios (Vercel status, GitHub PR fix, Mintlify
+  publish, …) are reachable through the same Task input by adding an
+  `examples:` block to their YAML.
+- A reusable chain primitive — the classifier is the first user, but
+  future composite scenarios (incident_response → aws_pulse →
+  github_pr_fix) can chain through the same mechanism.
+
+## What's changed
+
+### Backend
+
+- `worker/worker/graph/scenarios/schemas.py` — `Scenario.examples:
+  list[str]` field added. Scenarios that opt in to the universal input
+  declare 3–5 representative prompts that characterize their domain.
+- `worker/worker/graph/scenarios/orchestrator.py` — three additions:
+  1. Tier-3 resolution rule: `metadata.kind == "task"` with no
+     explicit `scenario_id` / `intent_route` routes to
+     `intent_classifier`. Programmatic callers that set
+     `scenario_id` / `intent_route` are unaffected.
+  2. Chain primitive — `ScenarioResult.chained_intent_route` plus a
+     loop in `run()` capped at `MAX_CHAIN_DEPTH=3`. When a level's
+     `output_parsed.chosen_intent_route` is set, the orchestrator
+     re-dispatches the same job to the chosen scenario via
+     `metadata.scenario_id` (tier-1 explicit pin).
+  3. Classifier-failure safety net — when the classifier itself aborts
+     or returns no usable route, the orchestrator chains to `quick_qa`
+     so the user gets a useful response rather than a routing fault.
+- `worker/worker/graph/scenarios/runners.py` — JSON response levels
+  auto-populate `level.output_parsed`; the runner promotes
+  `chosen_intent_route` from a level's parsed output to top-level state
+  so the orchestrator's chain primitive picks it up.
+- `knowledge-hub/scenarios/intent_classifier.yaml` — the new meta
+  scenario. Two prompt levels: `classify` (free-tier JSON classifier
+  call with a schema verifier) and `disambiguate` (low-confidence
+  fallback that asks the user via `ask_user` with an enum schema).
+  Gate threshold: `level.classify.output_parsed.confidence >= 0.7`.
+- `worker/worker/graph/scenarios/prompts.py` — two new builders:
+  `intent_classifier_route` (synthesizes the registry into a routing
+  prompt) and `intent_classifier_disambiguate` (emits the ask_user
+  envelope + final JSON).
+- All user-facing scenarios (`aws_pulse_report`, `code_build`,
+  `document_writing`, `quick_qa`, `research_brief`, `security_review`)
+  backfilled with `examples:` blocks. Admin-only scenarios
+  (`code_build_strict`, `parallel_review_demo`) intentionally omit
+  examples so they stay out of the classifier catalog.
+- `quick_qa.yaml` — `intent_routes:` shrank from `[task, qa]` to
+  `[qa]`. The `task` route is reserved for the tier-3 classifier rule;
+  power users who want quick_qa directly should set
+  `scenario_id=quick_qa` or `intent_route=qa`.
+
+### Frontend
+
+- `apps/frontend/components/layout/footer/ask-user-enum-panel.tsx` —
+  new component. Detects enum-shaped `ask_user` schemas (`{type:
+  object, properties: {answer: {enum: [...], x-labels: {...}}}}`) and
+  renders one button per option. Click sends the chosen value via the
+  existing resume path.
+- `apps/frontend/components/workflow/timeline/event-timeline.tsx` —
+  the existing `ClarificationPrompt` now dispatches to
+  `AskUserEnumPanel` for enum schemas and falls back to the textarea
+  otherwise.
+- `apps/frontend/components/layout/footer/command-widget.tsx` — the
+  **AWS Pulse** card was removed (it was a temporary workaround
+  introduced before the classifier landed). The **Task** card's
+  description now reads "Free-text prompt; Cerebrum routes it to the
+  right scenario automatically".
+
+### Plumbing cleanup
+
+- `mother-ai/src/routes.rs` — `aws_pulse` removed from `SUPPORTED` and
+  the enqueue match. The AWS Pulse scenario is still loaded by the
+  worker; it's now reachable only through the Task input + classifier.
+- `worker/worker/main.py` — `orchestration_kinds` shrank from `{task,
+  project, aws_pulse}` to `{task, project}`.
+- `worker/worker/models.py` — `aws_pulse` dropped from the
+  `JobEnvelope.kind` Literal.
+- `apps/frontend/lib/mother-ai-client.ts` — `aws_pulse` dropped from
+  `CommandIntentKind`.
+
+## Impact scope
+
+- **Backwards-compatible.** Jobs that arrive with an explicit
+  `metadata.scenario_id` or `metadata.intent_route` bypass the
+  classifier entirely. Programmatic callers (replay harness, admin
+  tooling, internal automation) stay unaffected.
+- **Off by default for non-task kinds.** The tier-3 rule only fires
+  for `metadata.kind == "task"`. `kind=project` keeps its current
+  route to `code_build`. Other non-LLM kinds (`rule`, `fact`,
+  `planner`, `metric`) bypass the orchestrator entirely.
+- **One-time scenario library audit.** Every user-facing scenario
+  needs an `examples:` block to be discoverable through the universal
+  input. The bundled six were backfilled at ship; new scenarios should
+  add examples as part of the same PR that adds the scenario.
+- **Chain depth capped at 3.** The classifier counts as one hop, so
+  composable follow-ups (classifier → real scenario → optional
+  follow-on) have two more slots before the cap fires.
+
+## Tests
+
+- `tests/test_scenario_chain.py` — chain hop, MAX_CHAIN_DEPTH cap,
+  unknown-target fallback to quick_qa, metadata propagation.
+- `tests/test_intent_classifier_load.py` — YAML parses, prompt refs
+  resolve, scenario compiles with `when:` expression, classifier
+  catalog has the right opt-in shape.
+- `tests/test_intent_classifier_scenario.py` — end-to-end with
+  scripted FakeProviders: high-confidence path (no disambiguate),
+  low-confidence path (mocked ask_user resume → chain), schema-fail
+  retry recovery.
+- `tests/test_scenario_dispatch.py` — updated to reflect that `task`
+  is no longer in the route index.
+
+Run with:
+
+```bash
+/Users/azat/labs/cerebrum/worker/.venv/bin/python -m pytest \
+    tests/test_scenario_chain.py \
+    tests/test_intent_classifier_load.py \
+    tests/test_intent_classifier_scenario.py \
+    tests/test_scenario_dispatch.py -v
+```
+
+Pre-existing failures unrelated to this change:
+`test_provider_registry.py::test_paid_provider_fallback_chain` and
+`test_security_review.py::SecurityReviewEndToEndTests::*`.

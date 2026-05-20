@@ -35,8 +35,11 @@ When the worker boots:
 6. `PromptLevelRunner`, `VerifierLevelRunner`, `FanOutLevelRunner`,
    `HumanApprovalLevelRunner` are constructed and registered with
    `ScenarioExecutor` under their respective `kind` keys.
-7. `ScenarioCompiler(scenario, dispatcher=executor).compile()` produces a
-   LangGraph `StateGraph`. Topology rules:
+7. `ScenarioCompiler(scenario, dispatcher=executor).compile()` runs once for
+   **every** loaded scenario; the compiled graphs land in
+   ``_compiled_by_id`` keyed by scenario id. ``run()`` then picks one per
+   job — see [§ 3a](#3a-per-job-scenario-selection) below. Topology rules
+   (applied per scenario):
    - one node per level;
    - edges with `when: None` become unconditional `add_edge`s;
    - edges with a `when` clause are grouped per source and emitted as
@@ -44,6 +47,33 @@ When the worker boots:
      compiled DSL expressions in priority order and emits a
      `gate_decision` event when a branch fires;
    - levels with no outgoing edges implicitly route to `END`.
+
+## 3a. Per-job scenario selection
+
+The worker compiles every scenario at startup, then picks one **per job**.
+``ScenarioOrchestrator._resolve_scenario_for_job(payload)`` walks three
+sources, highest wins:
+
+1. **Explicit pin** — ``payload.metadata["scenario_id"]``. Used by replay
+   fixtures, admin tools, and the future universal-input classifier that
+   wants to override the route mapping.
+2. **Intent-route mapping** — ``payload.metadata["intent_route"]`` looked up
+   in the ``intent_route → scenario_id`` index the loader built from each
+   scenario's ``intent_routes`` declaration. Lookup is case-insensitive.
+   Today's bundled mapping:
+   ``project → code_build``, ``document``/``writing → document_writing``,
+   ``task``/``qa → quick_qa``, ``research → research_brief``,
+   ``security_review → security_review``. Two scenarios claiming the same
+   route is a hard load error — the dispatch must be unambiguous.
+3. **Default** — ``CEREBRUM_DEFAULT_SCENARIO`` env or ``code_build``. Also
+   the fallback when an explicit id is unknown or a route is unmapped (the
+   run continues with a warning log; a misconfigured payload must never
+   break the job).
+
+The selection appears in the ``scenario_started`` event as
+``selection_reason``: ``"explicit"``, ``"intent_route:<route>"``, or
+``"default"`` — useful for telemetry and "why did this scenario run?"
+debugging.
 
 ## 3. Job invocation
 
@@ -100,36 +130,71 @@ order) until the graph reaches `END`.
 7. Runs `state.budget` check; on exceeded, sets `aborted_reason` and
    emits `budget_exceeded`.
 8. Per-level post-processing:
-   - `l1_brief`: `_summary_from_json` collapses the JSON envelope to a
-     readable summary stored as the level's output.
-   - `l3_accept` / `fact_check`: extract verdict from the JSON envelope,
-     write to `state.verdict`, register failure with the escalation
-     tracker on FAIL, set `escalate_now` when the budget is hit.
-   - `polish` / `synthesis` / `answer` / `l2_escalate` / `final_report`:
-     these are terminal-output levels; their result.output becomes
-     `state.final_output`.
+   - `l1_brief`: emits a Markdown brief (goal + acceptance criteria)
+     directly — no JSON envelope, no collapse step; its prose *is* the
+     level output L2/L3 read.
+   - `l3_accept` / `fact_check`: extract the verdict via
+     `_verdict_from_l3_output` — a trailing ` ```control ` fence first
+     (`worker/runtime/control_block.py`), then a lenient JSON path
+     (plain `{verdict}` or `extra.verdict`). When neither yields a clean
+     PASS/FAIL, a single bounded **repair-retry** re-asks with the
+     contract spelled out before falling through. The verdict is written
+     to `state.verdict`; FAIL registers a failure with the escalation
+     tracker and sets `escalate_now` when the conflict budget is hit.
+   - `polish` / `synthesis` / `answer` / `final_report`: terminal-output
+     levels; their `result.output` becomes `state.final_output`.
 9. If the level itself declared verifiers (e.g., an `llm_judge` rubric on
    `l3_accept` or `fact_check`), the runner invokes them through the
    `VerifierRunner` and folds the per-verifier outcomes into the level
    state alongside the prompt result.
 
+### `kind: tool_loop` (`ToolLoopLevelRunner`)
+
+`l4_execute` and `l2_escalate` are **agentic file-tool loops** — the model
+mutates the project workspace through tool calls executed by the worker
+(Claude Code style: the **filesystem is the artifact**, not the message
+transcript). Downstream levels receive the *touched paths*, never file
+bodies.
+
+1. Builds the task prompt via `prompt_ref` (no Markdown file-fence
+   contract — the runtime provides the tools) and emits the
+   `agent_handoff` / `routing_decision` events like `prompt`.
+2. Loops up to `Level.metadata["max_iterations"]` (default 40):
+   - **paid** transport — `LlmProviders.call_model_turn(messages,
+     tools=anthropic_tools())` returns text plus native `tool_use` blocks;
+   - **free** transport — only when the *first* paid turn fails and the
+     level allows `fallback_outside_allow`: the textual ` ```tool ` /
+     ` ```tool_result ` protocol over `call_free_model`.
+3. Each tool call (`read_file` / `write_file` / `edit_file` / `list_dir`
+   / `delete_file` / `finish`) is dispatched via
+   `worker/runtime/file_tools.execute_tool` against `_project_cwd`,
+   sandboxed by `code_applier._safe_relative`. Every call streams a
+   `tool_call` + `tool_result` event; writes also emit `file_created`.
+4. The loop ends on `finish`, an empty turn, `max_iterations`, the
+   scenario budget, or a user **Stop** (`bus.is_cancelled()`, checked per
+   turn). Every turn's usage folds into the running aggregates.
+5. Writes the level state: `output` = the `finish` summary,
+   `touched_paths` = the runner's authoritative write-tool set. Terminal
+   tool-loop levels (`l2_escalate`) also set `state.final_output`.
+
 ### `kind: verifier` (`VerifierLevelRunner`)
 
-1. If `level.id` is in the apply-files list (defaults to
-   `l3_build_verify`), parse the latest L4 markdown via
-   `parse_l4_markdown`, apply file blocks to disk via `apply_file_blocks`,
-   and emit a `file_created` event per file written.
-2. Build a `VerifierContext` with the project workspace, payload,
-   level output, and scratchpad.
-3. Emit `verifier_started` per declared verifier.
-4. Invoke `VerifierRunner.run(level.verifiers, ctx)`. Mode is
+1. The `l4_execute` tool loop already wrote its changes to disk, so there
+   is **no file-apply step** — the runner builds a `VerifierContext` with
+   the project workspace, payload, and scratchpad and runs the declared
+   verifiers directly.
+2. Emit `verifier_started` per declared verifier.
+3. Invoke `VerifierRunner.run(level.verifiers, ctx)`. Mode is
    `serial`, `parallel`, or `race` (see
    [scenarios-runtime.md][component]).
-5. Emit `verifier_finished` per result.
-6. On any failure, format the `BuildResult`-shaped error into a
-   feedback string and stash it on the scratchpad under
-   `build_feedback` so the next L4 retry picks it up. Register failure
-   with the escalation tracker on conflict id `build_failure`.
+4. Emit `verifier_finished` per result.
+5. Stash a one-line `build_result_summary` on the scratchpad (pass or
+   fail) so the `l3_accept` prompt can review plan-vs-done without
+   re-reading the workspace.
+6. On failure, format the `BuildResult`-shaped error into a feedback
+   string and stash it under `build_feedback` so the next L4 retry picks
+   it up. Register failure with the escalation tracker on conflict id
+   `build_failure`.
 7. Emit `build_verify_passed` or `build_verify_failed` for legacy
    compatibility.
 
@@ -189,16 +254,24 @@ edges. For conditional edges:
 * When nothing matches, the router falls through to `END` with a loud
   log entry — scenarios should declare a default `when: None` edge to
   avoid this.
+* **Kill-switch short-circuit:** when `state.aborted_reason` is set
+  (budget cap or user Stop), the router routes straight to `END` —
+  otherwise the stale state of skipped levels would route a retry edge
+  back into a loop (e.g. `l3_build_verify → l4_execute` forever).
 
 ## 6. Termination
 
 When the graph reaches `END`, the orchestrator:
 
-1. Reads the terminal state and synthesizes a `ScenarioResult`
-   (output = `state.final_output` or fallback to `levels[l4_execute].output`).
-2. Emits `scenario_finished` with `status: completed | aborted`,
-   `aborted_reason`, `total_cost_usd`, `total_tokens`,
-   `total_duration_ms`, and `levels_run`.
+1. Reads the terminal state and synthesizes a `ScenarioResult` (output =
+   `state.final_output` or fallback to `levels[l4_execute].output`).
+   It also carries `workspace_owned` (true when the scenario has a
+   `tool_loop` level), the `l3_build_verify` outcome, and `aborted_reason`
+   out to the thread runner.
+2. Emits `scenario_finished` with `status: completed | aborted |
+   cancelled`, `aborted_reason`, `total_cost_usd`, `total_tokens`,
+   `total_duration_ms`, and `levels_run`. `cancelled` is a user Stop;
+   `aborted` is a budget cap or a crash.
 
 The frontend's `ScenarioRunTimeline` consumes the event stream and
 derives the per-level / per-verifier / gate / budget views via the
@@ -207,15 +280,43 @@ sees the full story of the run — which model ran which level, which
 verifier passed or failed with what score, which branch the gate took —
 without polling any additional endpoint.
 
-## 7. Replay path
+## 7. User Stop
+
+A user can halt a running job from the workflow composer's Stop button
+at any step. The mechanism is a Redis flag, polled at safe points — no
+new thread, no signal handler:
+
+1. `POST /v1/jobs/:id/cancel` (mother-ai) sets `cerebrum:job:{id}:cancel`
+   (1 h TTL), marks the job terminal `cancelled` in the Redis status hash,
+   and best-effort marks `prompt_threads.status='cancelled'` in Postgres —
+   so the UI unsticks immediately even if no worker is holding the job.
+2. The worker observes the flag via `EventBus.is_cancelled()` (a memoized
+   `EXISTS` check): the executor polls it at **every level boundary**,
+   `ToolLoopLevelRunner` once **per tool turn**, and the Anthropic
+   streaming loop cuts a doomed generation short.
+3. On detection the executor sets `aborted_reason="cancelled_by_user"` —
+   the same kill-switch path as a budget abort: all remaining levels
+   skip, the gate router short-circuits to `END`, and `scenario_finished`
+   fires with `status: "cancelled"`.
+4. A cancelled run **discards partial work**: `main.py` skips
+   `commit_and_push` and marks the job + prompt `cancelled`. Only a new
+   prompt in the same workflow starts a fresh run from L1.
+
+(Stop only halts an *actively-running* worker; orphaned jobs — where the
+worker died without recovery — are a separate, tracked infra gap.)
+
+## 8. Replay path
 
 For CI / regression detection, the same pipeline runs against
 `CassetteProviders` instead of live `LlmProviders`. The cassette is a
 list of recorded `ModelCallResult` dicts on a golden fixture; every
-prompt-runner / llm_judge call pops the next entry in order. Verifier
-results are byte-for-byte deterministic (subprocess output or schema
-validation), so the replay harness can diff the run's verifier scores +
-verdict + cost against the fixture's `expected` block. The CI gate
-fails on any regression beyond declared thresholds.
+prompt-runner / `call_model_turn` / llm_judge call pops the next entry in
+order — a `tool_loop` cassette entry carries the `tool_calls` the loop
+dispatches. The harness provisions an ephemeral git workspace for any
+scenario with a `tool_loop` level. Verifier results are byte-for-byte
+deterministic (subprocess output or schema validation), so the harness
+diffs the run's verifier scores + verdict + cost against the fixture's
+`expected` block. The CI gate fails on any regression beyond declared
+thresholds.
 
 [component]: ../components/scenarios-runtime.md

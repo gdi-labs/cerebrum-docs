@@ -1,0 +1,46 @@
+---
+title: L4 Tool Loop — ask_user
+description: The L4 agentic tool loop (ToolLoopLevelRunner in worker/worker/graph/scenarios/runners.py)
+  can now pause itself mid-loop to ask the human a clarifying question. Before this
+  change the loop only had file-mutation tools and finish; on unde...
+---
+
+## What it enables
+
+- **Symmetric counterpart to Stop.** Stop is "user halts the agent"; `ask_user` is "agent asks the user." Both are implemented as cooperative pauses anchored to the start of each loop iteration.
+- **Better outputs on ambiguous prompts.** The L4 model can now name the ambiguity ("Use shadcn or radix?") and resume with the user's answer folded into the next `tool_result`, instead of picking arbitrarily and producing the wrong artifact.
+- **Same UX everywhere.** Reuses the existing `ask_user` agent (`worker/worker/graph/agents/ask_user.py`) — same `langgraph.types.interrupt` plumbing, same bus events (`ask_user`, `tool_call`, `tool_result`), same composer behavior. No new FE work was required for this feature.
+
+## What's changed
+
+- `worker/worker/runtime/file_tools.py`: added an `ask_user` schema entry (7th tool) with `question: string` (required) and `schema: object` (optional). Added `INTERRUPT_TOOLS = frozenset({"ask_user"})` and a guard in `execute_tool()` so any code that mistakenly tries to dispatch `ask_user` against the workspace gets a clear error rather than a silent miss.
+- `worker/worker/graph/agents/ask_user.py`: added `ASK_USER_TOOL_LOOP_INSTRUCTIONS` — a tool-loop-specific instructions block telling the model to call the tool (not emit the legacy `{"ask_user": ...}` JSON envelope) when it needs a clarification.
+- `worker/worker/graph/scenarios/runners.py`:
+  - `_dispatch_tool` extended with `ask_user_state: dict[str, int]` and `max_ask_user: int`. When the model calls `ask_user`, dispatch goes through `maybe_interrupt(...)` instead of `execute_tool(...)`. The helper emits the lifecycle (`tool_call`, `ask_user`, `tool_result`) itself, so the runner does NOT re-emit. On budget exhaustion, the runner emits a synthetic `tool_call` + error `tool_result` and tells the model "answer with available context or call finish."
+  - `_run_loop` initialises `ask_user_state = {"count": 0}` and reads `max_ask_user = level.metadata.get("max_ask_user_per_loop", 3)` per level. Default is 3 (constant `_TOOL_LOOP_DEFAULT_MAX_ASK_USER`).
+  - **Atomicity:** in the paid path, if a single Anthropic turn's `tool_calls` includes `ask_user` alongside other calls (e.g. `[ask_user, write_file]`), the runner dispatches `ask_user` only and synthesises a `skipped: ask_user took precedence` `tool_result` with `is_error: True` for each remaining `tool_use` — so Anthropic's "every `tool_use` gets a paired `tool_result`" invariant holds, and the model can retry the skipped calls next turn with the user's answer in hand.
+  - The L4 system prompt (paid + free + paid→free fallback) is augmented with `ASK_USER_TOOL_LOOP_INSTRUCTIONS`.
+
+## Impact scope
+
+- **Additive.** The L4 loop's existing termination paths (finish, no_tool_calls, max_iterations, budget, cancelled) are unchanged. `ask_user` adds a fifth way for a turn to end without finishing the loop: the model's `ask_user` call yields control to the user and the loop continues on the next iteration with the answer in the message history.
+- **Off-loop `ask_user` is unchanged.** `PromptLevelRunner._call_with_ask_user` (used by L1/L2/L3 prompt levels) still parses the legacy `{"ask_user": ...}` JSON envelope via `extract_ask_user`. The two paths share `maybe_interrupt`, the bus events, and the LangGraph interrupt mechanics — only the way the model *signals* a clarification differs (envelope vs. tool call).
+- **No DB / API contract changes.** The pause/resume goes through the existing LangGraph checkpointer; the FE composer already handles `ask_user` events. Nothing new for `mother-ai` to expose.
+- **Scenario YAMLs do not need changes.** The new tool is registered in `TOOL_SCHEMAS`, so every existing tool-loop level (today: `l4_execute`, `l2_escalate`) gains the capability automatically. Per-level overrides via `level.metadata.max_ask_user_per_loop` (e.g. set it to `0` in a security-sensitive tool loop where pausing is undesirable, or to `5` in a long-running one).
+
+## Tests
+
+`tests/test_tool_loop_runner.py::ToolLoopAskUserTests` (4 new tests, all passing):
+
+- `test_paid_loop_ask_user_pauses_and_resumes` — paid native tool-use path. Patches `langgraph.types.interrupt` to return `"shadcn"`; asserts `interrupt` was called with the model's question, the next turn carries a `tool_result` body of `{"ok": true, "answer": "shadcn"}`, and the loop terminates on the follow-up `finish`.
+- `test_free_loop_ask_user_via_textual_block` — same flow on the free transport: model emits a `` ```tool ``` `` block with `name=ask_user`, parsed by `parse_textual_tool_call`, dispatched the same way, answer round-trips through the prompt string.
+- `test_ask_user_budget_enforced` — five `ask_user` turns scripted; default budget (3) honored; the 4th call's `tool_result` carries `ok: false, error: "ask_user budget exhausted ..."`; `interrupt` was called exactly 3 times, never the 4th.
+- `test_paid_loop_ask_user_blocks_remaining_tool_calls_in_turn` — single Anthropic turn batches `[ask_user, write_file]`; asserts the workspace file was NOT written, and the `write_file` tool_use got a `skipped: ask_user took precedence` paired `tool_result` so Anthropic's invariant holds.
+
+Run:
+
+```bash
+/Users/azat/labs/cerebrum/worker/.venv/bin/python -m pytest tests/test_tool_loop_runner.py -v
+```
+
+12 tests pass (4 new + 8 pre-existing). The 9 pre-existing failures elsewhere in the suite (provider_registry, security_review, scheduler_producer, context_engine) are unrelated and already failed on master prior to this change.

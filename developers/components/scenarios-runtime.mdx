@@ -12,6 +12,15 @@ description: The scenarios runtime is the worker's pluggable engine for orchestr
   research, security, Q&A — ship as YAML + prompt builders + (optional) rubric
   markdown. No worker deploy required for a new flow once the relevant runners
   exist.
+* **Per-job scenario dispatch.** Each scenario YAML declares the
+  ``intent_route`` values it serves (``code_build`` → ``project``,
+  ``document_writing`` → ``document``/``writing``, ``quick_qa`` → ``task``/``qa``,
+  …). The worker compiles every loaded scenario once at startup and picks one
+  per job from (in priority): ``payload.metadata["scenario_id"]`` →
+  ``payload.metadata["intent_route"]`` mapped via the loader →
+  ``CEREBRUM_DEFAULT_SCENARIO``. The command widget's task type sets
+  ``intent_route``; the future universal-input classifier will set it (or pin
+  ``scenario_id`` directly) by classifying the prompt.
 * **Per-level model pinning.** Each level resolves its own `ModelConstraint`
   through `worker/worker/llm/resolver.py`,
   so an L4 executor can be pinned to Claude Opus while a Q&A scenario runs the
@@ -23,12 +32,21 @@ description: The scenarios runtime is the worker's pluggable engine for orchestr
   (`verdict == 'PASS' && !escalate_now`); the compiler evaluates them at routing
   time. `fan_out` parents run children in parallel; aggregators (`majority_pass`,
   `weighted_score`, `all_pass`) merge results.
+* **Agentic file-tool loop.** `kind: tool_loop` levels (`l4_execute`,
+  `l2_escalate`) mutate the project workspace through tool calls the worker
+  executes — surgical `edit_file`s on the scaffolded template, not a full-file
+  Markdown blob. The workspace filesystem is the shared state; levels exchange
+  paths + summaries.
 * **Human approval gates.** A `kind: human_approval` level pauses the graph via
   LangGraph's `interrupt()`, packages a question for the approver, and resumes
   with their reply as the gate-readable `verdict`.
-* **Budget kill switch.** Scenario-wide caps (cost / tokens / duration) fire
-  `budget_exceeded` and short-circuit subsequent levels with synthetic skipped
-  states; the run ends with `scenario_finished status="aborted"`.
+* **Budget kill switch + user Stop.** Scenario-wide caps (cost / tokens /
+  duration) and a user-initiated **Stop** both set `aborted_reason`, which
+  short-circuits subsequent levels with synthetic skipped states and routes the
+  gate straight to `END`. The run ends `scenario_finished status="aborted"` (a
+  cap) or `"cancelled"` (a Stop); a cancelled run discards partial work — no
+  commit/push. Stop is a Redis flag (`cerebrum:job:{id}:cancel`) the worker
+  polls between levels and per tool-turn via `EventBus.is_cancelled()`.
 * **Per-tenant overrides.** A partial YAML stored in Postgres deep-merges over
   the base scenario at orchestrator construction time, so an org can tweak
   budgets / constraints / verifier weights without forking the base file.
@@ -66,14 +84,23 @@ All paths under `worker/worker/graph/scenarios/`:
   runner. Wraps every invocation with `level_started` / `level_finished` events
   alongside the legacy `node_started` / `node_finished` pair (back-compat through
   one release).
-* `runners.py` — `PromptLevelRunner`, `VerifierLevelRunner`, `FanOutLevelRunner`,
-  `HumanApprovalLevelRunner`. See
+* `runners.py` — `PromptLevelRunner`, `ToolLoopLevelRunner`,
+  `VerifierLevelRunner`, `FanOutLevelRunner`, `HumanApprovalLevelRunner`. See
   [Scenario execution](/how-it-works/scenario-execution) for the per-runner
-  semantics.
+  semantics. `ToolLoopLevelRunner` drives the `kind: tool_loop` levels
+  (`l4_execute`, `l2_escalate`): an agentic file-tool loop where the model
+  mutates the workspace through `read_file` / `edit_file` / `write_file` /
+  `list_dir` / `delete_file` / `finish` tools — the **filesystem is the
+  artifact**, downstream levels receive paths, not file bodies.
 * `prompts.py` — Registered prompt builders for every scenario level
   (`l1_team_lead_brief`, `writing_outline`, `security_triage`, `qa_answer`, etc.).
   Builders return a `BuiltPrompt { body, response_kind, handoff_* }` and read
-  prior-level outputs from `state["levels"]`.
+  prior-level outputs from `state["levels"]`. code_build's L1 emits a Markdown
+  brief and L3 emits Markdown prose + a trailing ` ```control ` block carrying
+  the verdict (`worker/runtime/control_block.py`) — not a JSON `AgentMessage`
+  envelope; the runner runs a bounded repair-retry when the verdict won't parse.
+* `worker/runtime/file_tools.py` — the six sandboxed file tools + the native
+  (Anthropic) and textual transports the tool loop dispatches.
 * `aggregators.py` — `MajorityPassAggregator`, `WeightedScoreAggregator`,
   `AllPassAggregator`. Aggregator name is referenced from the parent
   `Level.fan_in.aggregator` field.

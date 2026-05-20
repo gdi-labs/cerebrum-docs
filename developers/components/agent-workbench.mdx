@@ -1,0 +1,104 @@
+---
+title: Agent Workbench panel
+description: The left-side workflow list in the Cerebrum dashboard (apps/frontend/components/workflow/panels/jobs-list-panel.tsx).
+  It is the entry point for inspecting any running, queued, or recently-completed
+  workflow.
+---
+
+## What it enables
+
+- Browse every visible (non-hidden) workflow in reverse-chronological order
+  without loading them all at once.
+- See new workflows appear within 2 seconds while anything is in flight,
+  and within 6 seconds otherwise — even when the browser tab is in the
+  background.
+- Recognize who launched each workflow from a per-user avatar
+  (`/team/{author}.png`) or a colored-initials fallback.
+
+## What changed
+
+### Backend — paginated list endpoint
+
+- `GET /v1/workflows` (handled by `list_workflows` in
+  `mother-ai/src/routes.rs`) now accepts:
+  - `limit` — page size. Clamped to `[1, 100]`; default `20`.
+  - `cursor` — opaque base64 (`URL_SAFE_NO_PAD`) of
+    `<updated_at_rfc3339>|<workflow_id>` returned by the prior page's
+    `next_cursor`.
+- Response shape extended (`WorkflowListResponse` in
+  `mother-ai/src/models.rs`) — adds `next_cursor: Option<String>`. Null
+  when fewer than `limit` rows were returned (i.e. end of list).
+- Postgres path uses keyset ordering — the `where` clause adds
+  `and (wr.updated_at, wr.workflow_id) < ($cursor_updated_at,
+  $cursor_workflow_id)`, and `order by wr.updated_at desc,
+  wr.workflow_id desc` provides the tie-break required for the cursor
+  comparison to be stable across rows sharing an updated_at second.
+- Redis fallback honors `limit` and emits a synthetic cursor for parity,
+  but is dev-only; real deployments run the Postgres path.
+
+### Frontend — infinite scroll + dynamic polling
+
+- The panel uses `useInfiniteQuery` with an `IntersectionObserver` sentinel
+  at the bottom of the list. When the sentinel intersects (120 px before
+  the actual end), the next page is fetched.
+- Polling cadence is computed from the loaded pages: if any workflow is in
+  a non-terminal state (`running` / `processing` / `queued` / `pending`),
+  the query refetches every 2 s; otherwise every 6 s.
+- `refetchIntervalInBackground: true` and `refetchOnWindowFocus: true` —
+  the panel keeps polling even when the tab is blurred (this was the
+  primary "the list never updates" symptom: the previous fixed
+  `refetchInterval` defaulted to pausing on blur).
+- End-of-list marker — once `hasNextPage` is false, a muted "No more
+  workflows" line is rendered at the bottom.
+- Row entry animation — each `WorkflowRow` is wrapped in a Framer Motion
+  `motion.div` with `initial={{ opacity: 0, y: 12 }}` →
+  `animate={{ opacity: 1, y: 0 }}` and a per-index `delay`
+  (`Math.min(i * 0.03, 0.3)`). The cap keeps a freshly-loaded second
+  page from stalling visibly. Rows also carry `layout` so a workflow
+  that bumps to the top on update glides instead of snapping.
+
+### Avatar identity normalization
+
+- All frontend write sites that previously emitted
+  `created_by: ${selectedUser}-ui` now emit `selectedUser` directly. Five
+  files touched: `components/layout/footer/task-output-modal.tsx`,
+  `components/graph/new-system-dialog.tsx`,
+  `components/workflow/editor/workflow-creation-screen.tsx`,
+  `components/workflow/editor/prompt-editor.tsx`,
+  `components/workflow/panels/workflow-prompt-composer.tsx`.
+- Defensive read normalization: when deriving the avatar slug, the panel
+  strips a trailing `-ui` so legacy DB rows resolve to the same
+  `/team/{author}.png` as fresh ones. The `onError` → initials fallback
+  remains for unknown authors.
+- Known team images live at `apps/frontend/public/team/` (currently
+  `azat.png`, `terry.png`). Adding a new teammate means dropping
+  `<handle>.png` in there and using the matching `created_by`.
+
+## Impact scope
+
+- Wire-compatible: existing callers that hit `GET /v1/workflows` without
+  query params still get a valid response — `limit` defaults to 20 (down
+  from the prior hard cap of 200) and `next_cursor` is additive.
+- Auth follow-up: once Cerebrum auth lands, `actor.user_id` will populate
+  `created_by` server-side and the frontend-side defaults become a safety
+  net only. The Rust `unwrap_or_else(|| "user".to_string())` at
+  `routes.rs:283` will then be removed.
+
+## Tests
+
+No automated tests cover this panel today; verification is manual:
+
+```bash
+# Type-check + lint
+cd apps/frontend
+npx --no-install tsc --noEmit
+npx --no-install biome check components/workflow/panels/jobs-list-panel.tsx \
+  lib/mother-ai-client.ts lib/schemas.ts
+
+# Rust
+cd ../../mother-ai && cargo check
+
+# E2E in the browser
+cd ../apps/frontend && pnpm dev
+# Open the workbench, scroll past 20, watch a new submission appear within ~2s.
+```

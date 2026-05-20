@@ -1,0 +1,81 @@
+---
+title: Project Identity — Display Name vs Slug
+description: 'Two users can now create projects with the same display name ("test",
+  "Hello world", …) without colliding on GitHub repos, Vercel projects, or local workspace
+  dirs. The data model splits a project into two fields: name (free-text, what u...'
+---
+
+## What it enables
+
+- **Project names are display-only.** Spaces, mixed case, accents, emoji-adjacent characters are all fine. Users type "My new landing page" and that string is what shows up everywhere user-facing.
+- **Slug is the identity.** A collision-free `slug` (auto-suffixed `-2`, `-3`, … on name collision) drives every external resource: GitHub repo path, Vercel project name, production URL, and the worker's local `<runtime>/<instance>/projects/<slug>` dir.
+- **No more silent shared state.** Before this change, two "test" projects upserted into a single Postgres row, shared one GitHub repo (`gdi-labs/test.git`), one Vercel project, and one production URL. Now each one gets its own row, its own `<gdi-labs/test, test-2, test-3>` repo, and its own Vercel project / production URL.
+- **Workflows list shows the project name.** `/workflows` now reads `metadata.project.name` per workflow and renders it as the row title; non-project workflows still fall back to the objective text.
+
+## What's changed
+
+**Postgres** (`worker/worker/storage/postgres_repo.py`)
+
+Idempotent migration in `ensure_schema()`:
+
+- `alter table projects add column if not exists slug text`
+- `update projects set slug = name where slug is null` (backfill — existing names were already unique)
+- `alter table projects drop constraint if exists projects_name_key` (drop old `name UNIQUE`)
+- `create unique index if not exists idx_projects_slug on projects (slug)`
+- `alter table projects alter column slug set not null`
+
+After the migration the column is `slug TEXT NOT NULL UNIQUE` and `name TEXT NOT NULL` (no longer unique).
+
+**mother-ai** (`mother-ai/src/models.rs`, `mother-ai/src/routes.rs`)
+
+- `ProjectRecord` gains `slug: String`; `CreateProjectRequest` stays as `{name, kind, repo_url, base_branch, created_by}` — slug is server-side derived.
+- `validate_project_name` relaxed to 1–80 characters; rejects control chars only. Accepts spaces, mixed case, Unicode.
+- `slugify(name)` mirrors the worker's `_sanitize` so the slug is safe as both a GitHub repo name and a filesystem directory (alphanumeric + `._-`, collapsed dashes, lowercased, `unnamed` fallback).
+- `insert_project_in_postgres` allocates a unique slug with bounded retry: scan `slug = $base OR slug LIKE '$base%'`, pick the first free `-N` suffix (starting at `-2`), `INSERT`, retry on the `idx_projects_slug` unique-violation if another worker won the race (8 attempts max).
+- `list_projects_from_postgres` and the create response both serialize `slug`.
+
+**Worker** (`worker/worker/runtime/project_workspace.py`, `worker/worker/runtime/vercel_deployment.py`)
+
+- `ProjectMetadata` gains `slug: str`. `from_job` reads `metadata.project.slug`; for workflows queued before this rollout (no slug field), it falls back to `_sanitize(name)` so the existing identity chain keeps working.
+- Three identity sites switched from `_sanitize(metadata.name)` to `_sanitize(metadata.slug)`:
+  - `_derive_public_remote` — GitHub repo path component
+  - `_ensure_remote_repository` — repo name passed to `ensure_github_repository`
+  - `prepare()` — local `project_dir = projects_dir / slug`
+- `VercelDeploymentManager.ensure_project` — `name=project_metadata.slug` (Vercel project names share a global team namespace, so the slug is what guarantees one Cerebrum project ↔ one Vercel project ↔ one stable production URL).
+
+**Frontend** (`apps/frontend/lib/mother-ai-client.ts`, `apps/frontend/components/layout/footer/command-widget.tsx`, `apps/frontend/components/workflow/panels/jobs-list-panel.tsx`)
+
+- `ProjectJobMetadata` and `Project` types gain `slug`. The picker / project list reads it back from the API.
+- The command widget no longer slugifies the name client-side. It cap-limits (1–80 chars) and strips control characters but otherwise sends the user's literal input as `name`. After `createProject` returns the canonical slug, the widget threads it into the workflow's `metadata.project.slug` so the worker uses the right identity.
+- The workflows list panel prefers `metadata.project.name` for the row title; falls back to `workflow.objective` for non-project workflows (intent jobs, prompt-only tasks).
+
+## Impact scope
+
+- **Additive on the wire.** `slug` is optional in `ProjectJobMetadata` for backwards compatibility — workflows queued before this rollout omit it and the worker derives one from the sanitized name on the fly (same behavior as before this change).
+- **Migration is idempotent.** Re-running `ensure_schema()` after the column already exists is a no-op. Existing project rows keep their `id`, `name`, and (now-populated) `slug` (== old name).
+- **No data loss.** Existing names map 1:1 to their slugs on first boot; nothing is renamed, no GitHub repo gets a different slug retroactively.
+- **Two display names "test" are no longer the same project.** Previously the second creation upserted into the first row; now it gets its own row with `slug = "test-2"` and an isolated GitHub repo / Vercel project. **This is the intentional behavior change.** If an operator wants two users to share a workspace, they pick the same project from the existing-project list (matched by `id`/`slug`, not by typing the same name).
+
+## Tests
+
+Worker: `pytest tests/test_tool_loop_runner.py tests/test_thread_runner.py` — all pass (the two `ProjectMetadata(...)` construction sites in `test_thread_runner.py` updated to pass `slug=`).
+
+Mother-ai: `cargo check && cargo test` — all 12 pass.
+
+Frontend: `npx --no-install tsc --noEmit` clean; `pnpm run lint` clean.
+
+```bash
+/Users/azat/labs/cerebrum/worker/.venv/bin/python -m pytest tests/
+cd /Users/azat/labs/cerebrum/mother-ai && cargo check && cargo test
+cd /Users/azat/labs/cerebrum/apps/frontend
+npx --no-install tsc --noEmit
+pnpm run lint
+```
+
+Manual verification after deploy:
+
+1. Create a project named "test" in the FE; confirm slug `test` in the projects list.
+2. Have another user create "test" — confirm a new row with slug `test-2`.
+3. Check Postgres: `select name, slug from projects order by created_at desc limit 5;`.
+4. Fire a project task on each — confirm the worker logs show two distinct `project_dir` paths (`projects/test`, `projects/test-2`), the Vercel `vercel_deployed` event shows two distinct `project_name` values, and the production URLs differ.
+5. Open `/workflows` — confirm the row titles show the display names ("test" for both), not the slug or the objective.

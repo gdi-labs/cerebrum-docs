@@ -1,0 +1,89 @@
+---
+title: Hide Workflow
+description: '## What it enables'
+---
+
+Workflows that are stuck (e.g. waiting on user input that will never
+come) can be removed from the Agent Workbench job list with a single
+click. The row's history stays in Postgres so analytics, audit, and
+post-hoc replay still see it; only the live job list filters it out.
+A hidden workflow can be restored via the `unhide` endpoint if needed.
+
+This unblocks the common case where an `awaiting_user` workflow
+clogs the list and would otherwise require a manual SQL update to
+clear.
+
+## What's changed
+
+### Backend
+
+- `worker/worker/storage/postgres_repo.py` — `workflow_runs` gains two
+  columns: `hidden boolean not null default false` and `hidden_at
+  timestamptz`. Added idempotently via `alter table ... add column if
+  not exists` so existing deployments upgrade on the next boot. A
+  partial index `idx_workflow_runs_visible` keeps the filtered list
+  query cheap. New helper: `set_workflow_hidden(workflow_id, hidden)`.
+- `mother-ai/src/routes.rs` — two new endpoints:
+  - `POST /v1/workflows/:workflow_id/hide`
+  - `POST /v1/workflows/:workflow_id/unhide`
+
+  Both go through the existing `authorize()` API-key check. Per the
+  current dev posture there is no separate admin role.
+- `mother-ai/src/routes.rs` `fetch_workflows_from_postgres` — list
+  query now includes `where wr.hidden = false`. Hidden rows still
+  resolve in the per-workflow `get_workflow_status` path so deep links
+  keep working.
+
+### Frontend
+
+- `apps/frontend/app/api/mother-ai/workflows/[workflowId]/hide/route.ts`
+  and `.../unhide/route.ts` — Next.js BFF proxies for the new endpoints.
+- `apps/frontend/lib/mother-ai-client.ts` — new `hideWorkflow({
+  workflowId })` client. Callers invalidate `["workflows-list"]` on
+  success so the row disappears immediately.
+- `apps/frontend/components/workflow/panels/jobs-list-panel.tsx` —
+  each `WorkflowRow` exposes a kebab button that confirms via
+  `window.confirm` and calls `hideWorkflow`. Selected row is cleared
+  on hide so the detail panel doesn't dangle.
+
+## Impact scope
+
+- **Backwards-compatible.** Existing workflows default to `hidden =
+  false`. No migration data backfill is needed.
+- **Open by default.** Any caller with a valid mother-ai API key can
+  hide or unhide. A real role gate can be layered in later by tightening
+  the handler — endpoints are already gated through `authorize()`.
+- **Analytics safe.** All telemetry queries (`compute_job_flow`,
+  `compute_footer_activity`, `compute_live_activity`, agent fleet) read
+  `prompt_threads` / `job_runs`, which are untouched. Hiding only
+  changes what the job list endpoint returns.
+- **Redis fallback unaffected.** When Postgres is not configured the
+  list endpoint falls back to scanning `cerebrum:workflow:*` Redis
+  keys; hidden flags are not enforced there because the same row falls
+  out of Redis naturally as it ages.
+
+## Tests
+
+Smoke test the round trip manually with the dev stack running:
+
+```bash
+curl -X POST -H "x-api-key: $MOTHER_AI_API_KEY" \
+  "$MOTHER_AI_URL/v1/workflows/<workflow_id>/hide"
+# expect HTTP 204; the row no longer appears in GET /v1/workflows.
+
+curl -X POST -H "x-api-key: $MOTHER_AI_API_KEY" \
+  "$MOTHER_AI_URL/v1/workflows/<workflow_id>/unhide"
+# row reappears in the list.
+```
+
+Rust compile check:
+
+```bash
+cd mother-ai && cargo check
+```
+
+Frontend type-check:
+
+```bash
+cd apps/frontend && npx --no-install tsc --noEmit
+```

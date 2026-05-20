@@ -1,0 +1,77 @@
+---
+title: Job Telemetry Snapshot
+description: '## What it covers'
+---
+
+`worker/telemetry/snapshot.py` produces the JSON the dashboard reads
+from `/v1/command-center/snapshot`. Three of its tiles were systematically
+overstating activity because their SQL filters were too loose; this doc
+records the corrected semantics so they don't regress.
+
+## Tiles and their semantics
+
+### `compute_job_flow` — Stage throughput / Flows tile
+
+- **In flight** counts `prompt_threads.status = 'running'` only.
+  Previously this also included `queued`, `blocked`, and `awaiting_user`,
+  which inflated the count with stuck work.
+- **Queued** counts `status in ('queued', 'blocked')` as its own stage.
+- **Awaiting user** counts `status = 'awaiting_user'` as its own stage.
+- **Free / Paid lane** stages are now derived per-thread from the most
+  recent `job_runs.route` (`paid_model` → paid; anything else, including
+  not-yet-routed threads, → free). Both lanes appear in the Sankey
+  whenever they contain work.
+- Frontend: `apps/frontend/components/dashboard/widgets/job-flow.tsx`
+  carries the matching `STAGE_LABEL`/`STAGE_COLOR` entries (`paid` is
+  now labeled "Paid lane" with a distinct purple tile; the previous
+  copy-paste bug labeled it "Free lane").
+
+### `compute_footer_activity` — Footer agents rail
+
+- **Workflows** stat counts `workflow_runs` with `status in ('queued',
+  'running', 'blocked')`, `completed_at IS NULL`, and `updated_at >
+  now() - interval '1 hour'`. The `completed_at IS NULL` clause prevents
+  workflows that already reached a terminal state — but whose status
+  was later flipped back by `reconcile_workflow_status` — from leaking
+  in. The 1-hour activity window drops abandoned workflows from the
+  number.
+
+### `compute_live_activity` — Activity tracker tile (queued badge)
+
+- **`queuedTasks`** = `prompt_threads.status in ('queued', 'blocked')
+  AND updated_at > now() - interval '5 minutes'` plus the Redis
+  `queue_depth`. The recent-activity filter prevents a long-`blocked`
+  prompt from showing as "queued" forever; Redis remains authoritative
+  for the real queue.
+
+## Pricing (related)
+
+Paid-model token pricing lives in `worker/worker/llm/providers.py`
+`_PRICING_PER_1K`. `claude-opus-4-7` and the bare `anthropic` fallback
+reflect our contracted rate (1/3.5 of Anthropic's published list); the
+explicit `claude-3-5-sonnet-latest` entry stays at list. `cost_usd` on
+`job_runs` is computed from this table; the UI formats the resulting
+number and never sees per-token figures.
+
+## Impact scope
+
+All changes are read-side / cosmetic. No schema migration, no wire
+break. A worker restart picks up the new pricing on the next job; the
+telemetry API picks up the new tile queries on its next snapshot.
+
+## Tests
+
+Touched code is covered by the existing telemetry tests:
+
+```bash
+/Users/azat/labs/cerebrum/worker/.venv/bin/python -m pytest \
+    tests/ -k "snapshot or job_flow or footer or live_activity" -v
+```
+
+Manual verification:
+
+- Run `select count(*) from prompt_threads where status = 'running'`
+  against the dev DB and confirm the "In flight" tile matches.
+- Trigger a paid-lane job (`routing_hint=paid_model`) and confirm the
+  computed `cost_usd` is ~3.5× lower than a hand-multiplication of the
+  old `(0.015, 0.075)` rates.

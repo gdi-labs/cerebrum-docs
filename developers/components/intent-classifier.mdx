@@ -1,0 +1,190 @@
+---
+title: Intent Classifier
+description: The intent_classifier is a meta scenario that routes free-text prompts
+  to the right downstream scenario. It is the first user of the scenario chaining
+  primitive in the orchestrator — when the classifier picks a target, the orchestrator
+  r...
+---
+
+## When it runs
+
+The `ScenarioOrchestrator._resolve_scenario_for_job` resolution has
+four tiers:
+
+1. **Explicit pin** — `metadata.scenario_id` wins. Used by replay,
+   admin tooling, and the chain primitive itself when re-dispatching.
+2. **Intent route mapping** — `metadata.intent_route` looked up in
+   each scenario's declared `intent_routes`.
+3. **Tier-3: classifier default** — `metadata.kind == "task"` with no
+   higher-priority pin routes here. This is the path the
+   command-widget Task card sends.
+4. **Orchestrator default** — `CEREBRUM_DEFAULT_SCENARIO` or
+   `code_build`.
+
+The classifier is **not** registered for any `intent_route`. Leaving
+`intent_routes: []` keeps it from claiming any route name and prevents
+it from recommending itself as a target.
+
+## Architecture
+
+```
+user types in the Task panel
+   │
+   ▼
+mother-ai enqueues with kind=task
+   │
+   ▼
+worker pops envelope → ScenarioOrchestrator._resolve_scenario_for_job
+   │  (no scenario_id, no intent_route)
+   ▼
+intent_classifier scenario
+   │
+   │  classify level (kind=prompt, response_kind=json, free:* tier)
+   │      ─ input: prompt + synthesized scenario catalog
+   │      ─ output: {chosen_intent_route, confidence, reason, candidates}
+   │      ─ schema verifier with on_fail=retry, max_retries=1
+   │
+   ├── confidence >= 0.7  ──► __end__ (classify is terminal)
+   │
+   └── confidence <  0.7  ──► disambiguate level
+                                 ─ turn 1: emit {"ask_user": {"schema": {...enum...}}}
+                                 ─ FE renders as button panel
+                                 ─ user clicks → resume folds answer back
+                                 ─ turn 2: emit {"chosen_intent_route": "<answer>", ...}
+                                                                                │
+                                                                                ▼
+                                                   orchestrator picks up chosen_intent_route
+                                                   from terminal state, re-dispatches via
+                                                   metadata.scenario_id (chain hop)
+```
+
+## Two-level shape
+
+`classify` is a pure prompt level. It synthesizes every
+classifier-eligible scenario into the prompt's AVAILABLE SCENARIOS
+block:
+
+```
+- aws_pulse_report (AWS Pulse Report): Daily AWS pulse...
+    examples: "what's today's AWS spend?"; "audit our cloud security posture"; ...
+- code_build (Code Build (default hierarchy)): L1 brief -> L2 plan -> ...
+    examples: "ship a hello-world Next.js app"; "refactor the auth module"; ...
+- ... (one bullet per opt-in scenario)
+```
+
+The model returns a JSON envelope:
+
+```json
+{
+  "chosen_intent_route": "aws_pulse_report",
+  "confidence": 0.92,
+  "reason": "prompt asks about cloud security posture",
+  "candidates": [
+    {"intent_route": "aws_pulse_report", "score": 0.92},
+    {"intent_route": "security_review",  "score": 0.05}
+  ]
+}
+```
+
+A `schema` intra-verifier catches malformed envelopes; the level
+retries once. If both attempts fail, the orchestrator's
+classifier-failure safety net chains to `quick_qa`.
+
+`disambiguate` only runs on the low-confidence branch. The first model
+turn emits an `ask_user` envelope carrying an enum schema; the FE
+renders this as a button panel inside the task modal; the user clicks
+their pick; the resume folds the answer back; the second turn emits
+the final `chosen_intent_route` JSON.
+
+## Catalog construction
+
+The orchestrator builds the classifier catalog **once at startup** in
+`__post_init__`:
+
+```python
+self._classifier_catalog = [
+    {"id": sid, "display_name": sc.display_name or sid,
+     "description": sc.description.strip(), "examples": list(sc.examples)}
+    for sid, sc in self._scenarios_by_id.items()
+    if sc.examples and sid != INTENT_CLASSIFIER_SCENARIO_ID
+]
+```
+
+A scenario is "classifier-eligible" iff it declares a non-empty
+`examples:` block. That keeps admin/debug scenarios
+(`code_build_strict`, `parallel_review_demo`) out of the catalog
+without a separate flag.
+
+The catalog is threaded into the LangGraph state as
+`state["classifier_catalog"]` so the prompt builder reads it without
+needing to touch the orchestrator directly.
+
+## Chain primitive
+
+`ScenarioResult` carries two new fields:
+
+- `chained_intent_route: str | None`
+- `chain_reason: str | None`
+
+When any level's `output_parsed` contains a `chosen_intent_route`
+field, the runner promotes it onto top-level state. The orchestrator's
+`run()` reads this after the compiled-graph invocation, builds a new
+payload pinned to the target scenario via `metadata.scenario_id`,
+bumps `_chain_depth`, emits a `scenario_chained` event, and recurses.
+
+`MAX_CHAIN_DEPTH = 3` caps the chain depth. The classifier counts as
+one hop, so composite follow-ups have two more slots before the cap.
+
+`CLASSIFIER_FALLBACK_SCENARIO_ID = "quick_qa"` is the safety net the
+orchestrator chains to when:
+
+- the classifier emitted no `chained_intent_route` AND its
+  `aborted_reason` is set or output is empty, OR
+- the classifier emitted a `chosen_intent_route` that isn't a loaded
+  scenario id (hallucination).
+
+Both cases preserve the user's job — they get a useful response
+instead of a routing fault.
+
+## Files
+
+- `knowledge-hub/scenarios/intent_classifier.yaml` — the scenario YAML
+- `worker/worker/graph/scenarios/prompts.py` —
+  `intent_classifier_route` + `intent_classifier_disambiguate`
+- `worker/worker/graph/scenarios/orchestrator.py` — tier-3 rule, chain
+  loop, classifier-failure safety net (`MAX_CHAIN_DEPTH`,
+  `INTENT_CLASSIFIER_SCENARIO_ID`, `CLASSIFIER_FALLBACK_SCENARIO_ID`)
+- `worker/worker/graph/scenarios/runners.py` — auto-populates
+  `output_parsed` on JSON levels; promotes `chosen_intent_route` to
+  state
+- `worker/worker/graph/scenarios/state.py` — `chained_intent_route`,
+  `chain_reason`, `classifier_catalog` fields on `ScenarioState`
+- `apps/frontend/components/layout/footer/ask-user-enum-panel.tsx` —
+  the FE button-panel renderer
+
+## Configuration
+
+Locked decisions (2026-05-18):
+
+| Setting | Value | Where |
+|---|---|---|
+| Confidence threshold | `0.7` | `intent_classifier.yaml` `when:` clause on the `classify → __end__` edge |
+| Classifier-failure fallback | `quick_qa` | `orchestrator.CLASSIFIER_FALLBACK_SCENARIO_ID` |
+| Chain depth cap | `3` | `orchestrator.MAX_CHAIN_DEPTH` |
+| Model tier | free-tier (Ollama / equivalent) with paid fallback | `model_constraint: { allow: ["free:*"], fallback_outside_allow: true }` |
+
+## Future composition
+
+Once `chained_intent_route` is a first-class field, scenarios chain
+arbitrarily. Examples this primitive unlocks:
+
+- **incident_response** — classify alert → fetch logs (aws_pulse-like)
+  → diagnose (LLM) → propose fix → chain to `github_pr_fix` if the
+  user approves.
+- **monitoring_digest** — aws_pulse + vercel_status + github_open_prs
+  → synthesize a single morning brief.
+- **ambient_oncall** — long-running scenario that periodically chains
+  to whichever specialist scenario the latest alert maps to.
+
+The intent_classifier is the first instance; the infrastructure it
+needed (chain field + depth cap + scenario_chained event) is generic.
