@@ -1,0 +1,92 @@
+---
+title: Frontend Authentication & Authorization
+description: '## What it enables'
+---
+
+The Command Center used to run with no authentication — every route was open
+and identity was a hardcoded `azat / terry` toggle. It is now a real
+multi-user application:
+
+- **Google sign-in** for every user (Better Auth — free, open-source, MIT).
+- **Two roles.** Admins see and manage everything; members see only their own
+  workflows.
+- **Invite-only access.** A new Google account can authenticate but lands
+  *pending* — disabled until an admin approves it. The emails in
+  `ADMIN_EMAILS` are auto-promoted to admin on first sign-in (azat, terry).
+- **Per-user monthly USD budgets**, set by admins. Once a member's
+  month-to-date spend reaches their cap, new runs are refused.
+- **Account disable.** Admins can disable any account; its sessions are
+  revoked immediately.
+- **An admin section** listing every user with role, status, budget, and
+  month-to-date spend, plus inline controls for all of the above.
+
+## What's changed
+
+All work is in `apps/frontend` plus one small change in `mother-ai`.
+
+**Auth core**
+- `lib/auth/auth.ts` — Better Auth server instance (Google provider, database
+  sessions, `admin` plugin, `budgetCents` custom field). A `databaseHooks`
+  create hook implements the invite-only gate.
+- `lib/auth/client.ts` — browser auth client. `lib/db.ts` — the frontend's
+  first Postgres connection (server-only pooled `pg`).
+- `app/api/auth/[...all]/route.ts` — Better Auth handler.
+- `lib/auth/schema.sql` — `user` / `session` / `account` / `verification`
+  tables + `auth_audit_log`. `lib/auth/backfill.sql` — one-time reassignment
+  of pre-auth workflows to the azat account.
+
+**Route protection**
+- `middleware.ts` — optimistic cookie gate on page routes.
+- `lib/auth/guards.ts` — `requireUser` / `requireAdmin` (pages) and
+  `requireApiUser` / `requireApiAdmin` (route handlers).
+- Route group `app/(authenticated)/` holds the app chrome and a server-side
+  `requireUser()` gate; `app/(authenticated)/admin/` adds `requireAdmin()`.
+  `/login` renders outside the group.
+- Every `app/api/**` BFF route is guarded — mother-ai routes via the shared
+  proxy, the rest with explicit guards.
+
+**Per-user scoping**
+- `mother-ai`: `GET /v1/workflows` gained an optional `created_by` filter
+  (`src/routes.rs`, `src/models.rs`).
+- `lib/auth/workflow-scope.ts` — `stampActor` writes identity onto outbound
+  payloads server-side; `requireWorkflowAccess` / `requireJobAccess` enforce
+  ownership via indexed reads on `workflow_runs` / `job_runs`.
+
+**Budgets & admin**
+- `lib/auth/budget.ts` — month-to-date spend from `job_runs.cost_usd`;
+  `enforceBudget` preflights BFF write routes (HTTP 402 over budget).
+- `GET /api/me/budget` feeds the settings panel.
+- `lib/auth/admin.ts`, `app/api/admin/users/**`, and
+  `app/(authenticated)/admin/users/` — the user-management surface; every
+  mutation is written to `auth_audit_log`.
+
+**New env vars** (`apps/frontend/.env.example`): `DATABASE_URL`,
+`BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `GOOGLE_CLIENT_ID`,
+`GOOGLE_CLIENT_SECRET`, `ADMIN_EMAILS`, `DEFAULT_BUDGET_USD`.
+
+## Impact scope
+
+- **Frontend** — auth is required everywhere; the fake `azat / terry` toggle
+  is gone. The frontend now holds a Postgres connection (server-side only).
+- **mother-ai** — additive only: a new optional query param, fully
+  backwards-compatible. It keeps its API-key auth; the Next.js BFF is the
+  per-user trust boundary (the browser cannot reach mother-ai directly).
+- **worker / infra** — unchanged. Auth tables live in the existing Postgres.
+- **Not backwards-compatible:** the app cannot be used signed-out. Pre-auth
+  workflows must be reassigned with `lib/auth/backfill.sql` after azat's first
+  sign-in, or their owner won't see them.
+- **Defaults:** new users are disabled until approved; budgets default to
+  `DEFAULT_BUDGET_USD`; admins are exempt from budget enforcement. The budget
+  cap is *soft* — checked at submission, so a running job can still overshoot.
+
+## Tests
+
+- Frontend: `cd apps/frontend && npx --no-install tsc --noEmit`,
+  `npx --no-install biome check .`, `pnpm build`.
+- mother-ai: `cd mother-ai && cargo check && cargo test`.
+- Worker suite (`tests/`) is unaffected — auth is frontend-side.
+- End-to-end (manual, needs `DATABASE_URL` + Google OAuth configured): sign in
+  as a non-admin → pending screen; sign in as an `ADMIN_EMAILS` account →
+  full access; approve the pending user; create workflows as two users and
+  confirm each sees only their own; drop a budget and confirm a 402; disable a
+  user and confirm the session is revoked.

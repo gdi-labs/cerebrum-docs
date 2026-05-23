@@ -31,6 +31,7 @@
               "capabilities/audit-and-cost",
               "capabilities/aws-pulse-report",
               "capabilities/declarative-agent-flows",
+              "capabilities/frontend-authentication",
               "capabilities/hide-workflow",
               "capabilities/scenario-aware-job-panel",
               "capabilities/universal-input"
