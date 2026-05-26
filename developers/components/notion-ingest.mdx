@@ -1,0 +1,94 @@
+---
+title: Notion ingest — v3 (authors, comments, databases, backfill)
+description: v3 lifts the Notion connector from "we have page bodies" to "we have
+  the whole corpus with author lineage, threaded discussions, database rows, and a
+  cross-link graph." The v1/v2 mechanics (CronJob, search-by-last_edited_time cursor,
+  3 r...
+---
+
+## What it enables
+
+- **Author lineage on every doc.** `owner` is the page's real Notion creator (mapped through `ingest/connectors/notion_users.yaml`), not a hardcoded `@notion-bot`. `notion-author:<handle>` and `notion-last-editor:<handle>` land as tags so retrieval can filter by who wrote / last touched a page.
+- **Threaded comments in the body.** Each page picks up a `## Comments` appendix listing every unresolved discussion (`### @handle — TIME (thread: id)` + nested replies). One Notion API call per page.
+- **Database rows are first-class documents.** A row in a Notion database emits as its own `.md` with the row's properties rendered as a table, `derived_from` linking back to the database index, and `scope = sources/notion/<ws>/<db-slug>`. Operational content (OKRs, tickets, runbooks) becomes retrievable per-row.
+- **Hierarchical scope.** A page's `scope` segment reflects its top-level Notion parent (`sources/notion/<ws>/<top-parent-slug>`), and the rel_path mirrors that nesting. Top-level pages stay at `sources/notion/<ws>`.
+- **Wikilink graph.** Notion @page mentions and notion.so href links resolve to `[[kh-id|display-text]]` wikilinks; the resolved kh-ids populate the doc's `related` frontmatter so graph traversal works at query time.
+- **One-shot bulk backfill.** A new `notion_backfill.py` enumerates the whole workspace in one pass, with the mention-rewriting step backed by a pre-built id→kh-id map (zero dead links for pages that exist in the corpus).
+
+## What's changed (surface)
+
+| Where | Change |
+| --- | --- |
+| `ingest/connectors/notion.py` | `NotionClient` gained `list_databases`, `query_database`, `list_comments`, `get_user`, `get_page`, `get_database` (all rate-limited, paginated, cached). `NotionRenderer` gained `mention_resolver` + `user_resolver` constructor args, a `_render_comments` pass, and `render_database_index` / `render_row`. `NotionConnector` accepts `user_map` + `mention_resolver`; `_page_to_record` detects database rows and emits them via `_row_to_record`; pages walk their parent chain to derive a hierarchical scope. |
+| `ingest/connectors/notion_backfill.py` | **New.** Two-pass workspace pull: pass 1 enumerates every page + database + row and builds the id→kh-id map; pass 2 renders with the resolver wired up and writes via the shared `base.write_record`. Emits `_index.md` with corpus stats + top-level page list + unmapped-user dump. |
+| `ingest/connectors/notion_users.yaml` | **New.** Maps Notion UUID → `@handle`. Unmapped UUIDs hit a deterministic fallback `@notion-<first-8-of-uuid>` and get printed by the backfill so you can extend the file. |
+| `ingest/run_connector.py` | Reads `NOTION_USER_MAP_PATH` env var (default: the file colocated with the connector module) and passes the loaded map into `NotionConnector`. |
+| `BaseConnector.ingest_version` | Notion overrides to `3` — every existing Notion doc gets rewritten on next cron tick so author / scope / comments land. Slack and GitHub stay at `2`; their content isn't affected. |
+
+## Frontmatter mapping
+
+| Field | Page | Database (index) | Row |
+| --- | --- | --- | --- |
+| `source_id` | `notion:page:<uuid>` | `notion:database:<uuid>` | `notion:row:<db-uuid>:<row-uuid>` |
+| `scope` | `sources/notion/<ws>` or `…/<top-parent-slug>` (4 segs max — schema limit) | `sources/notion/<ws>/<db-slug>` | `sources/notion/<ws>/<db-slug>` |
+| `owner` | `@<mapped-handle-from-created_by>` | same | same |
+| `tags` | `notion`, `notion-workspace:<ws>`, `notion-author:<h>`, `notion-last-editor:<h>`, `notion-parent:<slug>?` | + `notion-database` | + `notion-row`, `notion-database:<db-slug>` |
+| `created_at` | `page.created_time` (Notion's, not ingest time) | same | same |
+| `updated_at` | `page.last_edited_time` | same | same |
+| `valid_from` | same as `created_at` | same | same |
+| `related` | `[kh-id, …]` of pages/databases mentioned in the body | same | same |
+| `derived_from` | `[]` | `[]` | `[<db-kh-id>]` |
+
+Everything else (`team`, `sensitivity`, `pii_spans`) flows from the connector config.
+
+## Impact scope
+
+- **Re-index of every Notion page on next cron tick.** `ingest_version` bumped to 3 → idempotent rewrite triggered for every existing doc; Qdrant chunks regenerate on the same pod.
+- **Slack and GitHub are untouched.** Their `ingest_version` stays at 2.
+- **Path layout changes for nested pages.** A page that was at `sources/notion/<ws>/page.md` may move to `sources/notion/<ws>/<top>/page.md` on the first v3 tick. The `kh-id` is stable (derived from `source_id`), so retrieval keeps working; the old file path becomes a stale orphan and should be `git rm`'d after the first successful run.
+- **Database rows that previously emitted as plain "untitled" pages now emit as proper row docs** at `sources/notion/<ws>/<db-slug>/<row-slug>.md` with `derived_from = [<db-kh-id>]`. Old per-row files emitted under the old layout become orphans (same cleanup story).
+- **Cron API call count rises.** Each page render now calls `list_comments` once and walks parents via `get_page` (cached). For a workspace of ~500 pages with ~3-level nesting, expect ~1500 extra calls per full sweep, well under the 3 req/s rate limit but visibly slower per cron tick.
+- **Backwards-compatible default for unconfigured workspaces.** With no `notion_users.yaml` and no env var, the connector still runs; owners fall back to `NOTION_OWNER` (`@notion-bot`), comments still render with fallback handles.
+
+## Bulk backfill workflow
+
+```bash
+# from repo root
+export NOTION_TOKEN="ntn_..."
+/Users/azat/labs/cerebrum/worker/.venv/bin/python -m ingest.connectors.notion_backfill \
+  --workspace-slug gdi-labs \
+  --hub-dir knowledge-hub \
+  --user-map ingest/connectors/notion_users.yaml \
+  --dry-run
+```
+
+Pass 1 prints discovery totals (pages / databases / rows). Pass 2 prints per-status counts (written / updated / unchanged) and a final "Unmapped users" list. Add the printed UUIDs to `notion_users.yaml`, re-run without `--dry-run`, then commit the changes under `knowledge-hub/sources/notion/<workspace-slug>/`.
+
+The frontmatter linter runs automatically at the end unless `--skip-lint`.
+
+## Tests
+
+```bash
+/Users/azat/labs/cerebrum/worker/.venv/bin/python -m pytest tests/test_connector_notion.py -v
+```
+
+Coverage includes:
+- block rendering (paragraph, heading, lists, code, tables, divider) — unchanged from v1.
+- author resolution (mapped UUID → handle; unmapped → fallback slug; missing `created_by` → connector default).
+- hierarchical scope (top-level page → flat; nested page → `<top>` suffix; rows → `<db-slug>` scope + `derived_from`).
+- comment rendering (3-message thread groups, block-anchored vs page-anchored heading shape).
+- mention rewriting (Notion URL resolves to `[[kh-id|text]]`, populates `related`; unresolvable URL stays plain).
+- backfill discovery (pages + databases + rows enumerated; meta map covers all three; unmapped users captured).
+
+End-to-end:
+- `notion_backfill.py --dry-run` against the live workspace.
+- Run for real; pick two pages that link to each other in Notion; verify both `related` lists contain the other's kh-id after ingest.
+- `kb_search` (MCP) for a Notion page known by title; verify the result payload carries the right `owner` and `updated_at`.
+
+## Known limitations
+
+- **Resolved comments are unreachable** via the Notion API ([reference](https://developers.notion.com/reference/list-comments)). Only open discussions appear in the `## Comments` appendix. If preservation of resolved threads matters, manually re-open them in Notion before ingest.
+- **Notion-hosted image URLs still expire after ~1 hour.** v3 keeps the v1 behavior of inlining the URL as-is — images render in the markdown but 404 outside the freshness window. Rehost-to-S3 is tracked as a follow-up.
+- **Formulas, rollups, synced blocks export as computed values only.** Source logic is not retrievable from the API.
+- **Workspace-level access requires a manual share step.** A Notion admin must share the integration at the workspace root (or each top-level page) before the backfill enumerates anything. The integration token alone is not enough.
+- **Mention rewriting on the cron is disabled by default.** The cron leaves notion.so URLs as plain links (rewriting to dead wikilinks for un-ingested pages would be worse than not rewriting). The backfill, which sees the full corpus, is where rewriting happens.
