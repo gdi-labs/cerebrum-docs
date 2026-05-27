@@ -1,0 +1,69 @@
+---
+title: Project Console (/projects)
+description: '## What it enables'
+---
+
+A dedicated workspace per Cerebrum-built project, separate from the global Agent Workbench. Each project gets its own URL (`/projects/:slug`), its own KPI strip, its own workflow sidebar, its own conversation canvas, and its own ⌘K search. This is the surface long-running products like cachepool are driven from — every prompt, every file, every deploy belongs to one project rather than living as an isolated workflow in the global list.
+
+Concretely: a user lands on `/projects`, sees a card grid of all their projects with status, repo, branch, and last-edit timestamps, and opens one to a workspace that shows the project's full life — recent workflows, live activity, generated files, cost/time/tokens spent — all in one place. Selecting a workflow inside a project switches the canvas to a wider conversation lane (~1100px composer, vs. ~500px in the legacy three-panel Workbench) with the agent's scenario, graph, and live deployment preview rendered above the threads.
+
+## What's changed
+
+### Backend (mother-ai)
+
+- `GET /v1/projects/:slug` — single-project lookup by collision-free slug. Returns `ProjectRecord` (id, name, slug, kind, repo_url, base_branch, created_by, timestamps). Path: `mother-ai/src/routes.rs`.
+- `GET /v1/workflows?project_slug=<slug>` — new optional filter on the existing list endpoint. Applies to both page rows and `total_count`, using a `metadata->'project'->>'slug'` JSON path filter at the SQL layer. The handler's optional-clause builder was refactored to a running param-index counter so the next filter we add slots in without re-indexing `$N` positions.
+- `ListWorkflowsQuery.project_slug: Option<String>` added to `mother-ai/src/models.rs`.
+
+### Frontend BFF
+
+- `GET /api/projects/[slug]` proxies the new mother-ai endpoint through `requireApiUser` ([apps/frontend/app/api/projects/[slug]/route.ts](../../../../../apps/frontend/app/api/projects/[slug]/route.ts)).
+- `GET /api/mother-ai/workflows` now forwards `project_slug` when present (`apps/frontend/app/api/mother-ai/workflows/route.ts`).
+
+### Frontend client
+
+- `getProject(slug)` and a new `projectSlug` argument on `listWorkflows()` in `apps/frontend/lib/mother-ai-client.ts`.
+- `useWorkflowSession(workflowId)` hook in `apps/frontend/lib/workflow/use-workflow-session.ts` lifts the workflow status + prompts + active-job SSE + scenario-derived state out of `WorkflowPanels` so both the legacy Workbench and the new console share one source of truth. (A prior commit had already updated `WorkflowPanels` to import this hook without committing the file itself — this change unbreaks HEAD.)
+- "Projects" nav entry added between Workbench and Atlas in `apps/frontend/components/layout/app-header.tsx`.
+
+### Frontend route surface
+
+All under `apps/frontend/app/(authenticated)/projects/`/projects/):
+
+- `page.tsx` — `/projects` index, max-w-[1680px] frosted-card layout with a 1–3 column responsive project grid.
+- `projects-list-view.tsx` — list view + create-new modal (`POST /api/projects`).
+- `[slug]/page.tsx` + `[slug]/project-detail-view.tsx` — the per-project shell. Header card on top, collapsible sidebar (workflows + changelog) on the left, main canvas on the right, ⌘K palette and new-workflow dialog overlaid.
+- `[slug]/project-header.tsx` — hero line stitched from list facts (no extra round-trips), `LastActivityBadge`, six-tile KPI strip (Workflows, Prompts completed/total, Running, Failed, Warnings, Last edit).
+- `[slug]/use-project-workflows.ts` — shared `useInfiniteQuery` hook + `aggregateProjectStats` helper. Sidebar, KPI strip, showcase feed, changelog, and ⌘K palette all consume the same React Query cache key (`["project-workflows", slug]`).
+- `[slug]/project-workflow-sidebar.tsx` — refactored from `JobsListPanel`. Status filter, infinite scroll, "+ Workflow" button. No avatar column since all rows are same-project.
+- `[slug]/project-changelog.tsx` — chronological "what changed" feed (last 12 transitions) pinned to the sidebar bottom; clicking a row jumps to that workflow.
+- `[slug]/workflow-showcase-feed.tsx` — empty-state replacement: six most recent workflows rendered as rich cards, each pulling its latest prompt thread via `useQueries` and showing the agent's actual output as a 3-line clamped preview.
+- `[slug]/selected-workflow-canvas.tsx` — when a workflow is selected, mounts (in order): slim header, `StatusTicker`, `WorkflowSummaryTile` (cost/tokens/time/files/build), reused `ScenarioHeader`, reused `AgentGraphCard`, `ArtifactPreview` (iframe of `metadata.project.production_url` when set, dashed placeholder otherwise), collapsible `FilesGenerated` list, and the existing `JobContextPanel` (threads + composer). Per-status radial-gradient hue on the canvas.
+- `[slug]/new-workflow-dialog.tsx` — submits via `submitChat({ project: {…} })` so the resulting workflow is stamped with `metadata.project.slug` and surfaces immediately in the project's own list.
+- `[slug]/project-cmd-k.tsx` — project-scoped ⌘K palette. Arrow-key navigation, fuzzy search on objective + workflow id, "+ Workflow" fallback when nothing matches.
+
+## Impact scope
+
+- **Affected subsystems**: mother-ai (Rust HTTP layer), Next.js BFF + UI. Worker unchanged. Auth/permissions inherit the existing `requireApiUser` + non-admin `created_by` scoping.
+- **Backwards compatibility**: the new `project_slug` query param is optional; callers that don't pass it see exactly the same behaviour as before. Existing workflows that already carry `metadata.project` on the worker side become filterable immediately — no backfill required.
+- **Defaults**: `/projects` is visible to every signed-in user. Workflows created via the new "+ Workflow" button are stamped with the project metadata automatically. The ⌘K palette only activates when focus is on a `/projects/:slug` page.
+- **Auto-runs**: none. No new cron jobs or background workers; the page polls via React Query with the same active/idle intervals the Workbench uses (2s while anything is running, 6s idle).
+- **Known stubs (slots reserved, follow-ups tracked elsewhere)**:
+  - `db: not provisioned` chip — wires to the DB provisioning work (capability missing).
+  - `scenario: not configured` chip — wires to scenario live-edit (capability missing).
+  - Composer attachment dropdown items remain `console.info` stubs.
+  - Pinned/featured workflows not yet implemented.
+  - Hero line is synthesised from list facts, not an AI summarisation job.
+
+## Tests
+
+- **Rust**: `cd mother-ai && cargo check` — passes. No new unit tests added; the new SQL filter is exercised end-to-end via the FE.
+- **TypeScript**: `cd apps/frontend && npx --no-install tsc --noEmit` — passes.
+- **Biome**: `cd apps/frontend && pnpm run lint` (or `npx --no-install biome check`) — passes.
+- **Manual verification path**:
+  1. `cd apps/frontend && pnpm dev`
+  2. Visit `/projects`, click "+ New project", create one (slug `console-test` for example).
+  3. Open `/projects/console-test`, hit ⌘K to confirm the palette opens.
+  4. Click "+ Workflow", submit a prompt; confirm it appears in the project sidebar and the showcase feed (when you deselect), and that the KPI strip increments.
+  5. Select the workflow to see the summary tile / scenario card / agent graph / artifact preview / files list / wider composer mount.
+- **No pre-existing test regressions introduced.** The `tests/test_intent_route_policy.py` and `worker/worker/graph/intent_route_policy.py` modifications visible in the working tree at session start are unrelated WIP and not part of this change.

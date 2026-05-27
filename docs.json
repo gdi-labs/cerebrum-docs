@@ -33,6 +33,7 @@
               "capabilities/declarative-agent-flows",
               "capabilities/frontend-authentication",
               "capabilities/hide-workflow",
+              "capabilities/project-console",
               "capabilities/scenario-aware-job-panel",
               "capabilities/universal-input"
             ]
