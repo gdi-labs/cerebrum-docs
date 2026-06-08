@@ -191,12 +191,27 @@ bodies.
 5. Stash a one-line `build_result_summary` on the scratchpad (pass or
    fail) so the `l3_accept` prompt can review plan-vs-done without
    re-reading the workspace.
-6. On failure, format the `BuildResult`-shaped error into a feedback
-   string and stash it under `build_feedback` so the next L4 retry picks
-   it up. Register failure with the escalation tracker on conflict id
-   `build_failure`.
+6. On failure, format **every** failed verifier into a feedback string —
+   the build stderr tail plus any other gate's reasons (e.g. the
+   `route_reachability` orphan/misplaced-route list) — and stash it under
+   `build_feedback` so the next L4 retry fixes all blockers. Register
+   failure with the escalation tracker on conflict id `build_failure`.
 7. Emit `build_verify_passed` or `build_verify_failed` for legacy
    compatibility.
+
+`code_build`'s `l3_build_verify` runs two verifiers: `build` (install +
+`next build`) and **`route_reachability`** — a deterministic, no-LLM gate
+that every Next.js App Router route is navigable from `/`. It flags
+*orphan* routes (a `page.*` nothing reachable from the home page links to)
+and *misplaced* pages (a `page.*` written into a parallel `app/` tree such
+as `apps/frontend/app/...`, which Next never routes), following
+`Link`/`href`/`router.push`/`redirect` targets transitively through
+imported components. Dynamic (`[id]`) and `api` routes are exempt, and a
+project with no `app/` dir skip-passes (so non-Next builds and the replay
+harness are untouched). The `l3_build_verify → l3_accept` edge ANDs both
+verifiers, so a navigability failure routes back to L4 with the offending
+routes — same retry/escalation budget as a build failure. `code_build_strict`
+adds it alongside `typecheck` + `lint`.
 
 ### `kind: aggregator` (`FanOutLevelRunner`)
 

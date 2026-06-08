@@ -72,7 +72,10 @@ Outcomes:
   new component. Detects enum-shaped `ask_user` schemas (`{type:
   object, properties: {answer: {enum: [...], x-labels: {...}}}}`) and
   renders one button per option. Click sends the chosen value via the
-  existing resume path.
+  existing resume path. (Update 2026-06-03: this disambiguation panel is
+  now rendered by the `UniversalFeedbackPanel` via the `x-feedback`
+  contract — `intent_classifier_disambiguate` dual-emits both shapes. See
+  the [Universal User-Feedback System](/capabilities/user-feedback-system).)
 - `apps/frontend/components/workflow/timeline/event-timeline.tsx` —
   the existing `ClarificationPrompt` now dispatches to
   `AskUserEnumPanel` for enum schemas and falls back to the textarea
@@ -82,6 +85,52 @@ Outcomes:
   introduced before the classifier landed). The **Task** card's
   description now reads "Free-text prompt; Cerebrum routes it to the
   right scenario automatically".
+
+### Follow-up prompts are classified per-prompt (2026-06-05)
+
+The classifier originally only ran for the *first* prompt of a workflow.
+Follow-up prompts appended to a workflow that was **seeded by the
+`project` command** inherited that seed's `metadata.intent_route="project"`
+(and `kind="project"`) via `merge_workflow_metadata`, so the worker matched
+the tier-2 `intent_route` rule and pinned **every** follow-up to
+`code_build` — running the full paid L1→L4 pipeline even for a pure
+question. The tier-3 classifier path was never reached.
+
+- `mother-ai/src/routes.rs` — new `reset_routing_keys_for_append` helper,
+  applied in `append_prompt` (both the Postgres and no-Postgres branches).
+  Before queuing an appended prompt it drops the inherited `intent_route`
+  and `scenario_id` and forces `metadata.kind="task"`, so each follow-up is
+  re-classified on its own content. The workflow's **project binding** (the
+  nested `project` object, `project_slug`, model/effort hints) is preserved
+  untouched, so a follow-up the classifier routes back to `code_build` still
+  targets the right repo.
+
+Result: a single workflow now freely mixes scenarios across prompts — e.g.
+*build a project → ask a question about it (`quick_qa`) → request a security
+review (`security_review`) → keep coding (`code_build`, same repo)*. The
+`_dispatch_chain` re-dispatch carries the `project` object through every hop,
+so repo targeting survives classification.
+
+Because the `project` binding is preserved on follow-ups, a non-code scenario
+(`quick_qa`, `research_brief`, `security_review`, `document_writing`) now runs
+with a project workspace present. The thread runner gates its **legacy
+markdown-apply + build-verify pipeline** on whether the resolved scenario owns
+the workspace (`scenario_workspace_owned`, i.e. has a `tool_loop` level). A
+scenario that ran but does *not* own the workspace skips that pipeline entirely
+— so a Q&A follow-up no longer parses its answer as L4 file blocks or emits a
+spurious `build_verify_started` / no-files-repair. See
+`worker/worker/orchestration/thread_runner.py` (the `scenario_non_mutating`
+branch in `run()`). Genuine code scenarios use `tool_loop` and keep their own
+`l3_build_verify` verdict; legacy non-scenario runs (no `scenario_id` in state)
+are unchanged.
+
+Boundary: this re-routes *classification*, not project *origination*. A
+workflow seeded by a plain `task`/QA prompt has no `project` object, so a
+mid-workflow "start a coding project" follow-up routes to `code_build` but
+runs **without** a repo/branch/Vercel binding (`ProjectWorkspaceManager.prepare`
+returns `None`). Originating a repo-backed project remains the job of the
+dedicated `project` command, which collects the structured fields the append
+composer does not.
 
 ### Plumbing cleanup
 
@@ -102,9 +151,11 @@ Outcomes:
   classifier entirely. Programmatic callers (replay harness, admin
   tooling, internal automation) stay unaffected.
 - **Off by default for non-task kinds.** The tier-3 rule only fires
-  for `metadata.kind == "task"`. `kind=project` keeps its current
-  route to `code_build`. Other non-LLM kinds (`rule`, `fact`,
-  `planner`, `metric`) bypass the orchestrator entirely.
+  for `metadata.kind == "task"`. The *first* `kind=project` prompt
+  keeps its route to `code_build`; **follow-up** prompts are reset to
+  `kind=task` on append and re-classified per-prompt (see "Follow-up
+  prompts are classified per-prompt" above). Other non-LLM kinds
+  (`rule`, `fact`, `planner`, `metric`) bypass the orchestrator entirely.
 - **One-time scenario library audit.** Every user-facing scenario
   needs an `examples:` block to be discoverable through the universal
   input. The bundled six were backfilled at ship; new scenarios should
@@ -116,7 +167,9 @@ Outcomes:
 ## Tests
 
 - `tests/test_scenario_chain.py` — chain hop, MAX_CHAIN_DEPTH cap,
-  unknown-target fallback to quick_qa, metadata propagation.
+  unknown-target fallback to quick_qa, metadata propagation, and
+  `test_chain_preserves_project_binding` (the `project` object survives
+  classification → chain so a code follow-up still targets the repo).
 - `tests/test_intent_classifier_load.py` — YAML parses, prompt refs
   resolve, scenario compiles with `when:` expression, classifier
   catalog has the right opt-in shape.
@@ -124,8 +177,19 @@ Outcomes:
   scripted FakeProviders: high-confidence path (no disambiguate),
   low-confidence path (mocked ask_user resume → chain), schema-fail
   retry recovery.
-- `tests/test_scenario_dispatch.py` — updated to reflect that `task`
-  is no longer in the route index.
+- `tests/test_scenario_dispatch.py` — `task` is no longer in the route
+  index, plus `test_appended_followup_with_project_binding_reclassifies`
+  (a `{kind:"task", project:{…}}` follow-up with no `intent_route`
+  resolves to `intent_classifier`, not `code_build`).
+- `mother-ai` (`cargo test`) — `reset_routing_keys_for_append` unit
+  tests: strips `intent_route`/`scenario_id`, forces `kind="task"`,
+  preserves `project`; composes with `merge_workflow_metadata`; passes
+  through non-object metadata.
+- `tests/test_thread_runner.py` —
+  `NonMutatingScenarioInProjectTests`: a non-workspace-owning scenario
+  (`quick_qa`) in a project-bound run emits no `build_verify_*` events,
+  parses no L4 file blocks, and skips the empty push; a workspace-owning
+  scenario (`code_build`) still takes the carry-through path.
 
 Run with:
 

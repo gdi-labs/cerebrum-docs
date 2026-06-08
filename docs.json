@@ -35,7 +35,8 @@
               "capabilities/hide-workflow",
               "capabilities/project-console",
               "capabilities/scenario-aware-job-panel",
-              "capabilities/universal-input"
+              "capabilities/universal-input",
+              "capabilities/user-feedback-system"
             ]
           },
           {

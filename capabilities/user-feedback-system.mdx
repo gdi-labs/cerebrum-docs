@@ -1,0 +1,149 @@
+---
+title: Universal User-Feedback System
+description: '## What it enables'
+---
+
+One first-class way for any scenario to pause and ask the human a
+question — a list of options, a free-form reply, or both — instead of
+silently guessing. Before, three things were true and limiting:
+
+- Code-build (and any `kind=new` project) silently auto-picked a
+  template (`nextjs` vs `nextjs-app`) from a single free-model call. The
+  user never saw the choice, let alone got to confirm or override it.
+- The frontend understood only three hard-coded `ask_user` schema
+  shapes (enum buttons / approve-reject / free text), each rendered by a
+  bespoke panel and dispatched by duplicated detection logic.
+- Multi-select and "pick an option **or** type something else" were not
+  expressible at all.
+
+Now a single **feedback contract** expresses every shape, one panel
+renders all of them, and the template choice pauses for confirmation
+**when the selector isn't confident** — auto-picking when it is. The
+same gate primitive is reusable by any future scenario.
+
+Outcomes:
+- The user confirms or redirects the path when it matters
+  (low-confidence template pick), and is never interrupted when it
+  doesn't (high-confidence pick auto-proceeds).
+- Any new option-pick / clarification / multi-select question is a
+  YAML-or-schema change, not new UI.
+- The in-run reply box and the main task composer share one input
+  control.
+
+## What's changed
+
+### The feedback contract (new)
+
+- `worker/worker/graph/feedback.py` — `FeedbackRequest` /
+  `FeedbackOption` / `FeedbackResponse` pydantic models,
+  `build_feedback_schema(...)`, `read_feedback_request(...)`, and
+  `parse_feedback_response(schema, value)`. The request rides verbatim
+  in the existing `ask_user` payload's `schema` field as a JSON-Schema
+  object carrying an `x-feedback` vendor extension:
+
+  ```jsonc
+  {"type": "object",
+   "x-feedback": {
+     "prompt": "Which template should I scaffold from?",
+     "select": "single",              // single | multi | none
+     "options": [{"id": "nextjs-app", "label": "Next.js (App Router)",
+                  "description": "RSC, app/ dir", "recommended": true},
+                 {"id": "nextjs", "label": "Next.js (Pages Router)"}],
+     "free_text": "optional",         // none | optional | required
+     "min_select": 1, "max_select": 1}}
+  ```
+
+  The normalized reply is `{"selected": [...], "text": "..."}`; a bare
+  string or `{"answer": "..."}` is still accepted for single-select
+  (legacy enum panel back-compat).
+- `apps/frontend/lib/types/feedback.ts` — the TS mirror +
+  `readFeedbackRequest(schema)` returning `null` when `x-feedback` is
+  absent (so legacy detectors still fire).
+
+### Worker
+
+- `worker/worker/graph/scenarios/runners.py` — `HumanApprovalLevelRunner`
+  generalized with a `feedback_mode` switch (`approval` default |
+  `select` | `input`). On resume it validates via
+  `parse_feedback_response` and folds per `metadata.assign`
+  (`intent_route` → scenario chaining; any other key → that state key).
+  `_unwrap_pick` now also reads the `{selected: [...]}` shape.
+- `worker/worker/graph/scenarios/schemas.py` — new `human_feedback`
+  LevelKind alias (shares the runner).
+- `worker/worker/graph/scenarios/orchestrator.py` — registers the alias.
+- `worker/worker/orchestration/template_selector.py` — `SelectionResult`
+  now carries `confidence` (model self-reported, clamped 0–1, defaults
+  to 0.0 → fail toward asking) and `candidates` (the enabled templates).
+- `worker/worker/main.py` — `_maybe_select_template` is confidence-gated:
+  at/above `template_confirm_threshold` it auto-picks; below it (and only
+  when >1 candidate) it **parks the job pre-graph** via
+  `_park_for_template_confirmation` — emits an `ask_user` with the
+  `x-feedback` options (model pick marked `recommended`), stashes the
+  serialized `JobEnvelope` + a `pending_kind="pre_graph_template"` marker
+  on the job's Redis hash, and sets `status=awaiting_user`.
+  `_resume_pre_graph_template` pins the chosen template (or the
+  recommended pick when the user only typed a note), threads any
+  free-text note into the prompt, clears the markers, and re-enqueues —
+  reusing the normal job path.
+- `worker/worker/config.py` — `template_confirm_threshold`
+  (`TEMPLATE_CONFIRM_THRESHOLD`, default `0.0` = ship dark / never pause;
+  set `0.7` to mirror the intent-classifier gate).
+- `worker/worker/graph/scenarios/prompts.py` —
+  `intent_classifier_disambiguate` now **dual-emits** the `x-feedback`
+  block alongside the legacy `answer.enum` keys (drop the legacy keys
+  once every client renders the universal panel).
+
+### Frontend
+
+- `apps/frontend/components/layout/footer/universal-feedback-panel.tsx`
+  (new) — `UniversalFeedbackPanel` renders any `FeedbackRequest`: buttons
+  (single) / checkboxes (multi, honoring min/max) / a free-text area
+  (optional/required), with the `recommended` option pre-selected.
+  Submits `{selected, text}`.
+- `apps/frontend/components/input/composer-textarea.tsx` (new) — the
+  shared textarea primitive (⌘/Ctrl+Enter submit) used by both the
+  feedback panel and the main task composer.
+- `event-timeline.tsx` (`ClarificationPrompt`) and
+  `task-output-modal.tsx` — route `x-feedback` to the universal panel
+  first, falling back to the legacy enum/approval/text detectors. The
+  bespoke `AskUserEnumPanel` / `AskUserTextPanel` remain as adapters.
+
+## Impact scope
+
+- **Backwards-compatible.** No event or transport rename — the contract
+  rides the existing `ask_user` `schema` field. Legacy enum / approval /
+  free-text runs render unchanged. The intent-classifier disambiguation
+  and security-review approval gate still resume correctly.
+- **Defaults to off.** `template_confirm_threshold=0.0` means template
+  selection auto-picks exactly as before; raising the threshold turns on
+  the pause. The `human_feedback` LevelKind and `feedback_mode` are
+  opt-in per level.
+- Affects: worker scenario runners + template selection + main loop,
+  the FE ask_user rendering path. The pre-graph park leaves the lane
+  assigned (same as an in-graph `human_approval` pause).
+
+## Tests
+
+- `tests/test_feedback_contract.py` — build/parse round-trips for all
+  four shapes; validation of min/max-select, required free-text, and
+  unknown option ids.
+- `tests/test_template_selector.py` — confidence parse/clamp; fallback
+  picks carry `0.0`; candidates always surfaced.
+- `tests/test_template_confirm_gate.py` — threshold `0.0` never parks;
+  low confidence parks with the `x-feedback` options; resume pins the
+  chosen template (or recommended) and re-enqueues with the note.
+- `tests/test_feedback_gate_runner.py` — `feedback_mode` folds (state
+  key + `intent_route` chaining + bare-string legacy + invalid-reply
+  no-crash); approval verdict regression.
+- Frontend: `npx --no-install tsc --noEmit` and `biome check` clean on
+  the changed files.
+
+Run the worker tests from the repo root:
+
+```bash
+worker/.venv/bin/python -m pytest tests/test_feedback_contract.py \
+  tests/test_template_confirm_gate.py tests/test_feedback_gate_runner.py \
+  tests/test_template_selector.py -v
+```
+
+Full suite is green (824 passed, 6 pre-existing skips) as of this change.
