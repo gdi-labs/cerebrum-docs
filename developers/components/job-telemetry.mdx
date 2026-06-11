@@ -35,6 +35,14 @@ records the corrected semantics so they don't regress.
   was later flipped back by `reconcile_workflow_status` — from leaking
   in. The 1-hour activity window drops abandoned workflows from the
   number.
+- Frontend presentation
+  (`apps/frontend/components/layout/footer/activity.tsx`): the category
+  dropdown (Agents Activity / Knowledge Stats / System Specs) was
+  replaced by gallery-style pagination dots to the right of the stat
+  blocks. Categories auto-rotate every 15 s (infinitely); hovering the
+  widget pauses rotation, and clicking a dot jumps to that category and
+  resets the timer. Snapshot payload and `useFooterActivity` are
+  unchanged — this is presentation-only.
 
 ### `compute_live_activity` — Activity tracker tile (queued badge)
 

@@ -17,6 +17,47 @@ The `/projects/:slug` console was reworked from a three-band poster header + sin
 - **Each card/row answers who+what+state in one glance** via a fixed four-corner identity stamp: kind tile (top-left), status pill (top-right), author avatar (bottom-left), prompt numbers + progress underline (bottom-right). Three reserved colour zones — kind = scenario tone, status = status colour, author = avatar ring — so no element ever carries two meanings.
 - **`needs_attention` is now surfaced on `/projects`** (a completed-with-warnings job no longer reads as a clean "completed"), via a shared status module the rail/board/changelog/mix all consume.
 
+### Refinement (2026-06-11): collapsible Workflows panel + latest prompt per row
+
+The project dashboard's **Workflows** section (`apps/frontend/app/(authenticated)/projects/dashboard/project-workflows-list.tsx`/projects/dashboard/project-workflows-list.tsx)) now:
+
+- **Collapses to its header, collapsed by default** — the dashboard leads with the deployment card; the header keeps the workflow count and the New-workflow action either way, and a caret toggle (rotates on expand) reveals the search box + rows.
+- **Shows the latest user prompt in each row**, truncated in muted text next to the (often auto-named) workflow title — so a row like `workflow:wf-188` also tells you what was last asked of it.
+
+Backing API change (additive): `WorkflowStatusResponse` gains `latest_prompt: Option<String>` — the newest `prompt_threads.prompt_text` per workflow, filled **only by the list query** (`GET /v1/workflows`) via a correlated subquery; single-workflow endpoints leave it null since they fetch full prompt threads separately. Paths: `mother-ai/src/models.rs`, `mother-ai/src/routes.rs` (`fetch_workflows_from_postgres`), zod schema in `apps/frontend/lib/schemas.ts`. Old clients are unaffected (`skip_serializing_if` on null; `.passthrough()` schema).
+
+### Refinement (2026-06-11): dashboard header — repo link for kind=new projects, Share, actions menu
+
+The dashboard tab bar (`apps/frontend/app/(authenticated)/projects/dashboard/project-dashboard.tsx`/projects/dashboard/project-dashboard.tsx)) gains:
+
+- **GitHub Repository link now shows for `kind=new` projects.** Root cause: the worker auto-provisions the GitHub repo for new projects but never backfills `projects.repo_url` (deliberately — feeding it back as `metadata.project.repo` on follow-up prompts would flip the worker's explicit-override path and disable repo auto-provisioning / `github_full_name` resolution, which Vercel self-heal depends on). Fix: mother-ai now lifts the public remote from the worker's push audit log (`job_runs.audit_log.project_push.remote_url`, falling back to `project_initial_push.remote_url`) into `metadata.project.repo_url` in **both** the single-workflow status query and `GET /v1/workflows` (`compose_workflow_metadata` in `mother-ai/src/routes.rs` — the list endpoint now runs the same overlay, which also makes `production_url` available to list consumers). The dashboard reads `project.repoUrl ?? deployment.repoUrl` (the `.git` suffix is trimmed for the browser link).
+- **Share button** (ShareNetwork icon) — copies the production URL (or the console URL pre-deploy) to the clipboard with a 1.5s "Copied" check flash.
+- **Actions menu** — a 3-dot trigger (radix `@radix-ui/react-dropdown-menu`, same pattern as the workflow rail rows) with a single **Delete** item. ~~Visual affordance only; deletion is not wired up yet.~~ Superseded same-day: Rename and Delete are both live — see the project-lifecycle refinement below.
+
+### Refinement (2026-06-11): project lifecycle — guaranteed binding, rename, delete, deployment duration
+
+**What it enables:**
+
+- **"+ New workflow" can no longer silently attach to a nonexistent project.** Workflow submissions carrying `metadata.project.slug` are validated against the `projects` table at enqueue time and the client's project snapshot (name/kind/base_branch/repo) is overwritten from the authoritative row — so the binding the `/projects` console relies on is server-guaranteed, not client trust.
+- **Rename a project** from the dashboard actions menu. Display name only — the slug (and the GitHub repo / Vercel project / workspace naming derived from it) is immutable. The server backfills `metadata.project.name` on every bound workflow in the same transaction, so legacy projects whose names were derived from the first prompt can finally be fixed, everywhere at once.
+- **Delete a project** (typed-name confirmation) — removes the project, all of its workflows, prompts, and run history from Cerebrum. The GitHub repository, Vercel project, and any provisioned database are deliberately **not** touched; the dialog says so.
+- **The deployment card's Duration field is real** — workflow wall-clock (`completed_at − created_at`) of the deployment workflow, formatted via the shared `formatDuration`; an em dash while queued/running.
+
+**What's changed:**
+
+- mother-ai (`mother-ai/src/routes.rs`, `mother-ai/src/models.rs`):
+  - `validate_and_stamp_project_binding` runs in `submit_chat`, `create_workflow`, and `submit_command_intent` (not `append_prompt`, which inherits stored workflow metadata). Unknown slug → 404. `project.repo` is only stamped when `projects.repo_url` is set (kind=existing) so kind=new repo auto-provisioning stays intact; a workflow-pinned `design_system_id` beats the project default. Without a Postgres DSN (dev mode) validation is skipped.
+  - `PATCH /v1/projects/:slug` (`UpdateProjectRequest { name }`) — renames + backfills `workflow_runs.metadata.project.name` via `jsonb_set`, transactionally, **without** bumping `workflow_runs.updated_at` (protects `updated_at desc` keyset cursors).
+  - `DELETE /v1/projects/:slug` — one transaction: lock project row (`for update`, so rename/delete races serialize), delete `job_runs` by both linkage paths (no FK), delete `workflow_runs` (`prompt_threads` cascade via FK), delete the project row. Returns 200 + `{deleted, slug, workflows_deleted}` (the BFF proxy re-serializes JSON bodies, so no 204). Redis queue/status keys self-expire via TTL.
+  - `WorkflowStatusResponse.completed_at: Option<DateTime<Utc>>` — read from `workflow_runs.completed_at` in both the list and single-workflow Postgres queries; null on Redis fallback paths. Additive (`skip_serializing_if`).
+- worker (`worker/worker/storage/postgres_repo.py`): new expression index `idx_workflow_runs_project_slug` on `(metadata->'project'->>'slug')` — serves the project-scoped list, the rename backfill, and the delete cascade. Idempotent, added in `ensure_schema()`.
+- Frontend BFF: `PATCH`/`DELETE` handlers on [apps/frontend/app/api/projects/[slug]/route.ts](../../../../../apps/frontend/app/api/projects/[slug]/route.ts); `PATCH` joins the proxy method union in `apps/frontend/app/api/mother-ai/_shared.ts`.
+- Frontend client/UI: `updateProject` / `deleteProject` in `apps/frontend/lib/mother-ai-client.ts`; `completed_at` in the zod schema (`apps/frontend/lib/schemas.ts`); new `rename-project-dialog.tsx` + `delete-project-dialog.tsx` under `apps/frontend/app/(authenticated)/projects/dashboard/`/projects/dashboard/); the dashboard's actions menu wires both, and `projects-workbench.tsx` drops back to the projects rail after a delete. `deriveDeployment` computes `durationMs` consumed by `deployment-card.tsx`.
+
+**Impact scope:** all additive except one intentional behavior change — submitting a workflow with a `metadata.project.slug` that has no `projects` row now returns 404 instead of queueing. Workflows without project metadata are untouched. Delete is Cerebrum-data-only; a job already running for a deleted workflow finishes and re-upserts a ghost workflow row carrying the dead slug (visible in the global `/workflows` list, 404 under the project) — accepted under the data-only scope. Rename is safe mid-flight: the worker's metadata upsert merges stored-wins (`excluded.metadata || stored`), so a completing job carrying the old name cannot clobber the backfill.
+
+**Tests:** `cargo test` in `mother-ai/` (5 new unit tests on the stamp function: identity refresh, repo None/Some, pass-through, design-system pinning — 23 total green); worker suite `worker/.venv/bin/python -m pytest tests/ -v` stays 0-fail; `tsc --noEmit` + biome clean in `apps/frontend`.
+
 ## What's changed
 
 ### Backend (mother-ai)
