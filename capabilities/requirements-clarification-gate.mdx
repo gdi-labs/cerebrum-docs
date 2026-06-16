@@ -1,0 +1,70 @@
+---
+title: Requirements-Clarification Gate
+description: '## What it enables'
+---
+
+When a user submits a vague build request — "build me a web app" — the team no
+longer silently invents a generic scope. On the **first build of a project** the
+pipeline pauses and asks the user *what to build*: a checklist of candidate
+features (the common defaults pre-checked) plus a free-text box. The confirmed
+feature set then drives the brief, plan, and execution.
+
+It is the inverse of the `scope gate`: the scope
+gate trims what the brief *over-added*; this gate elicits what the request
+*under-specified*. Both share the same `x-feedback` → `interrupt()` → resume
+machinery, so the frontend renders it with the existing universal panel — no FE
+change.
+
+## What's changed
+
+- **New detector** — `worker/worker/orchestration/requirements_detector.py`:
+  `detect_underspecification(raw_prompt, providers)` runs one free-model JSON
+  call and returns a `RequirementsClarification` (`vague`, candidate
+  `FeatureOption`s with `recommended` flags, `question`, `confidence`). Lenient
+  parse, fail-open.
+- **New runner** — `ClarifyRequirementsLevelRunner` in
+  `worker/worker/graph/scenarios/runners.py` (`kind=clarify_requirements`).
+  Builds a multi-select `x-feedback` schema (or a free-text ask when there are no
+  candidate options), interrupts, and folds `state["clarify_decision"] =
+  {selected, text, options}`. Interrupt-unavailable fallback accepts the
+  recommended features.
+- **Downstream consumption** — `_clarify_directive(state)` in
+  `worker/worker/graph/scenarios/prompts.py`, injected into the L1 brief, L2
+  plan, and L4 executor prompts as the authoritative feature scope. The scope
+  gate folds the confirmed features into the request it audits so they aren't
+  re-flagged as inflation.
+- **Scenario** — `knowledge-hub/scenarios/code_build.yaml`: `clarify_gate` is now
+  the first level (`clarify_gate → l1_brief → scope_gate → l2_plan → …`). New
+  `LevelKind` literal `clarify_requirements` in `schemas.py`.
+- **Config / env** — `WorkerConfig.clarify_requirements` (default `always`),
+  parsed from `CEREBRUM_CLARIFY_REQUIREMENTS=always|auto|never`. `main.py` stamps
+  `is_first_prompt` into job metadata so the in-graph runner only asks on the
+  first build.
+
+## Impact scope
+
+- **Default `always`** → every *first* build of a project pauses once for
+  confirmation. `auto` asks only when the detector judges the request vague;
+  `never` ships the gate dark. Follow-up prompts never re-ask, in any mode — flip
+  the env var with no logic redeploy.
+- Backwards-compatible: existing scenarios without a `clarify_requirements` level
+  are unaffected. Replays and non-interactive orchestrator runs force the gate to
+  `never` (it cannot answer an interrupt deterministically).
+- Frontend: no change — the universal feedback panel already renders multi-select
+  + free-text `x-feedback`.
+
+## Tests
+
+- `tests/test_requirements_detector.py` — detector JSON judge (vague vs specific,
+  prose-wrapped, fail-open, option filtering).
+- `tests/test_clarify_gate.py` — `never` / `auto` / `always` behavior, the
+  first-prompt-only rule, feature fold, free-text fallback, recommended-fallback,
+  replay dedup, the `_clarify_directive` injection, and config parsing.
+- `tests/test_scope_gate.py` — confirmed features fold into the scope detector's
+  request (de-conflict).
+- Updated structural/replay/event/cancel expectations for the new first level
+  (`tests/test_scenarios.py`, `test_scenario_phase6.py`, `test_scenario_compiler.py`,
+  `test_scenario_events.py`, `test_stop_cancel.py`).
+
+Run: `worker/.venv/bin/python -m pytest tests/` — 995 passed, 6 skipped (baseline
+green; the 6 skips are pre-existing).

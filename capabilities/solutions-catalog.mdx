@@ -1,0 +1,93 @@
+---
+title: Solutions Catalog & Template-Last Bootstrapping
+description: '## What it enables'
+---
+
+New projects are no longer fragile when a feature needs tooling the starter
+template doesn't ship. Previously a template was chosen and **scaffolded onto
+disk before the features were known**, so when a later feature needed (say) a
+database, the executor bolted `drizzle-kit` / `DATABASE_URL` wiring onto a
+starter that wasn't built for it — and silently failed.
+
+Two changes fix this:
+
+1. **Template-last discovery.** The first build now gathers **design → features →
+   solutions → intent** *before* choosing a template. Template selection is the
+   last decision before any real work (scaffold / repo / Vercel / DB), and it is
+   *capability-driven*: it requires a starter that already ships the tech stack
+   the confirmed features need. When no starter fully covers it, the build pauses
+   and asks rather than silently scaffolding a partial template.
+
+2. **Catalog of solutions.** A curated registry maps a feature (e.g. `waitlist`,
+   `auth`, `contact-form`, `payments`, `blog`) to its required template
+   capabilities, dev deps, precautions/warnings, and verification commands. The
+   catalog drives template selection, is injected into the L2/L4 prompts, and its
+   verify commands gate acceptance via a new verifier — so "is `drizzle-kit`
+   installed? did the schema land?" is checked deterministically.
+
+## What's changed
+
+New:
+- `knowledge-hub/solutions/registry.yaml` + `knowledge-hub/solutions/<feature>.yaml`
+  — the curated catalog (seed: waitlist, auth, contact-form, payments, blog).
+- `worker/worker/orchestration/solutions_catalog.py` — `SolutionsCatalog`,
+  `SolutionSpec`, `SolutionVerify`, `ResolvedSolutions`, `resolve_solutions(...)`
+  (deterministic id/alias match; optional free-model mapping for unknown
+  free-text; never drops intent — unknowns surface in `unmatched`).
+- `worker/worker/runtime/verifiers/builtins/solution_checks.py` — the
+  `solution_checks` verifier running `metadata.project.solutions.verify`.
+
+Changed:
+- `worker/worker/runtime/template_registry.py` — `TemplateSpec.capabilities` +
+  `format_summary_for_model(include_capabilities=…)`.
+- `worker/worker/orchestration/template_selector.py` — `select_template` takes
+  `required_capabilities` / `required_frameworks`; prefers a fully-satisfying
+  template, returns `missing_capabilities` + `needs_confirmation` (closest match)
+  when none covers the stack.
+- `worker/worker/runtime/design_registry.py` — `list_for_framework(None)` now
+  returns all enabled designs (design is picked before a template exists).
+- `worker/worker/main.py` — the discovery reorder: design (framework-agnostic) →
+  `_maybe_select_features` (+ resume) → `_resolve_and_stash_solutions` →
+  `_maybe_confirm_intent` (+ resume) → `_maybe_select_template` (last,
+  capability-aware). New pre-graph park kinds `pre_graph_features` /
+  `pre_graph_intent` wired into the resume dispatcher. `SolutionsCatalog` is
+  bootstrapped from the knowledge-hub checkout.
+- `worker/worker/graph/scenarios/prompts.py` — `_solutions_directive(state)`
+  injected into `l2_architect_plan` and `l4_executor`.
+- `worker/worker/graph/scenarios/runners.py` — `ClarifyRequirementsLevelRunner`
+  bridges a pre-gathered `metadata.project.clarify_decision` (no double-ask).
+- `worker/worker/config.py` — `confirm_intent` (`CEREBRUM_CONFIRM_INTENT`,
+  default `auto`).
+- `knowledge-hub/scenarios/code_build.yaml` — `solution_checks` added to
+  `l3_build_verify` and ANDed into the acceptance/escalation gate edges.
+
+## Impact scope
+
+- **Backwards-compatible.** The in-graph `clarify_gate`/`scope_gate` stay; the
+  clarify gate now no-ops when the decision was pre-gathered. `solution_checks`
+  skip-passes for non-DB / non-JS builds and when no recipe declared checks, so
+  the scenario-replay baseline (`regression_thresholds.build_pass_rate`) does not
+  regress.
+- **First-build only.** Every discovery gate fires only on the first
+  (scaffolding) prompt; follow-up prompts inherit the persisted decisions.
+- **Intent gate defaults to `auto`** — fires only when the request was vague or
+  no starter covers the required capabilities; `always`/`never` are available.
+- **Self-hosting preserved.** Catalog precautions reinforce self-hosted
+  persistence (drizzle + the project's Postgres) and never point features at
+  third-party form/data SaaS (Stripe is the bounded payments exception).
+
+## Tests
+
+Run from repo root: `worker/.venv/bin/python -m pytest tests/ -v`
+
+- `tests/test_solutions_catalog.py` — alias matching, union/dedupe aggregation,
+  framework intersection, `unmatched`, free-text model mapping.
+- `tests/test_template_selector_capabilities.py` — fully-satisfying preferred;
+  no-match → confirmation signal with `missing_capabilities`; framework filter.
+- `tests/test_solution_checks_verifier.py` — argv against a temp workspace,
+  optional skip-pass, skip-pass guards, `params.checks` override.
+- `tests/test_pre_graph_features_gate.py` / `tests/test_pre_graph_intent_gate.py`
+  — park/resume round-trips, first-build guards, idempotency.
+- `tests/test_clarify_gate.py` — the pre-gathered-decision bridge.
+- Updated: `tests/test_scenario_compiler.py`, `tests/test_scenario_events.py`
+  for the added `solution_checks` verifier.

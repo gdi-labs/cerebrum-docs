@@ -34,7 +34,9 @@
               "capabilities/frontend-authentication",
               "capabilities/hide-workflow",
               "capabilities/project-console",
+              "capabilities/requirements-clarification-gate",
               "capabilities/scenario-aware-job-panel",
+              "capabilities/solutions-catalog",
               "capabilities/universal-input",
               "capabilities/user-feedback-system"
             ]

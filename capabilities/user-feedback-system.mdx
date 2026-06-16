@@ -47,18 +47,51 @@ Outcomes:
      "prompt": "Which template should I scaffold from?",
      "select": "single",              // single | multi | none
      "options": [{"id": "nextjs-app", "label": "Next.js (App Router)",
-                  "description": "RSC, app/ dir", "recommended": true},
+                  "description": "RSC, app/ dir", "recommended": true,
+                  "swatches": [], "image_url": "https://cdn/preview.png"},
                  {"id": "nextjs", "label": "Next.js (Pages Router)"}],
      "free_text": "optional",         // none | optional | required
      "min_select": 1, "max_select": 1}}
   ```
+
+  Each option may carry optional **visual media** — `swatches` (a list
+  of CSS color strings rendered as a row of chips) and `image_url` (a
+  preview/screenshot URL rendered as a thumbnail). Both default empty
+  and are inert to validation, so an option without them renders as a
+  plain text choice exactly as before.
 
   The normalized reply is `{"selected": [...], "text": "..."}`; a bare
   string or `{"answer": "..."}` is still accepted for single-select
   (legacy enum panel back-compat).
 - `apps/frontend/lib/types/feedback.ts` — the TS mirror +
   `readFeedbackRequest(schema)` returning `null` when `x-feedback` is
-  absent (so legacy detectors still fire).
+  absent (so legacy detectors still fire). `readOption` maps the wire
+  `image_url` (snake_case) to `imageUrl` and filters `swatches` to
+  strings.
+
+### Visual media on options (new)
+
+Options can now show *what they look like*, not just describe it —
+generic `swatches` / `image_url` fields plumbed through the existing
+builders (no per-choice-type special-casing):
+
+- **Design / color themes → color swatches + preview.** `DesignSpec`
+  already carries summarized `tokens` (cssVars) and a `preview` string.
+  `worker/worker/orchestration/design_selector.py` threads `tokens` +
+  `preview` onto each candidate dict; `_design_confirm_options` in
+  `worker/worker/main.py` derives `swatches` from the **color tokens
+  only** (`background`, `foreground`, `primary`, `accent` — `radius` /
+  `font-*` excluded) and sets `image_url` from `preview`. Token values
+  pass through verbatim (`#rrggbb`, `oklch(...)`, `hsl(...)`) and are
+  used as raw CSS colors by the chips. Zero new data required.
+- **Templates → design screenshots.** `TemplateSpec` gains a
+  `preview_url` field, parsed from an optional `preview_url:` key in
+  each `template.yaml` (`worker/worker/runtime/template_registry.py`).
+  `worker/worker/orchestration/template_selector.py` sets each
+  candidate's `image_url` from it; `_park_for_template_confirmation`
+  spreads candidates straight into `FeedbackOption`, so the screenshot
+  flows through unchanged. Templates without a `preview_url` keep
+  `image_url=""` and render text-only.
 
 ### Worker
 
@@ -99,7 +132,10 @@ Outcomes:
   (new) — `UniversalFeedbackPanel` renders any `FeedbackRequest`: buttons
   (single) / checkboxes (multi, honoring min/max) / a free-text area
   (optional/required), with the `recommended` option pre-selected.
-  Submits `{selected, text}`.
+  Submits `{selected, text}`. Renders an option's `swatches` as a row
+  of color chips and its `image_url` via a local `OptionThumb`
+  (skeleton shimmer → fade-in, collapses on load error — the same
+  pattern as the deployment-card preview).
 - `apps/frontend/components/input/composer-textarea.tsx` (new) — the
   shared textarea primitive (⌘/Ctrl+Enter submit) used by both the
   feedback panel and the main task composer.
@@ -113,7 +149,9 @@ Outcomes:
 - **Backwards-compatible.** No event or transport rename — the contract
   rides the existing `ask_user` `schema` field. Legacy enum / approval /
   free-text runs render unchanged. The intent-classifier disambiguation
-  and security-review approval gate still resume correctly.
+  and security-review approval gate still resume correctly. The
+  `swatches` / `image_url` option fields are additive and default empty:
+  options that omit them render exactly as text-only choices.
 - **Defaults to off.** `template_confirm_threshold=0.0` means template
   selection auto-picks exactly as before; raising the threshold turns on
   the pause. The `human_feedback` LevelKind and `feedback_mode` are
@@ -126,7 +164,13 @@ Outcomes:
 
 - `tests/test_feedback_contract.py` — build/parse round-trips for all
   four shapes; validation of min/max-select, required free-text, and
-  unknown option ids.
+  unknown option ids; `swatches`/`image_url` round-trip + empty
+  defaults.
+- `tests/test_design_gate.py` — `_design_confirm_options` surfaces the
+  color palette (color tokens only, canonical order) + preview as
+  `image_url`, and stays strict (no `mode`/`tokens`/`preview` leak).
+- `tests/test_template_registry.py` — `preview_url` parsed (present /
+  absent → `""` / non-string coerced).
 - `tests/test_template_selector.py` — confidence parse/clamp; fallback
   picks carry `0.0`; candidates always surfaced.
 - `tests/test_template_confirm_gate.py` — threshold `0.0` never parks;
