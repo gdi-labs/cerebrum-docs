@@ -26,7 +26,7 @@ If the configured provider can't be reached, the run aborts. There is no silent 
 ```
 python ingest/ingest_hub.py
   [--hub-dir knowledge-hub]
-  [--collection cerebrum_knowledge_hub]
+  [--collection amos_knowledge_hub]
   [--chunk-size 1200] [--chunk-overlap 120]
   [--no-manifest]
   [--dry-run]
@@ -38,7 +38,7 @@ python ingest/ingest_hub.py
 | --- | --- |
 | `QDRANT_URL` | Qdrant endpoint. |
 | `QDRANT_API_KEY` | Qdrant auth (optional). |
-| `QDRANT_COLLECTION` | Collection name; default `cerebrum_knowledge_hub`. |
+| `QDRANT_COLLECTION` | Collection name; default `amos_knowledge_hub`. |
 | `EMBEDDING_PROVIDER` | One of `ollama`, `openai`, `hash`. |
 | `OLLAMA_BASE_URL`, `OLLAMA_EMBED_MODEL` | Ollama provider config. |
 | `OPENAI_API_KEY`, `OPENAI_EMBED_MODEL` | OpenAI provider config. |

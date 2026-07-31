@@ -58,7 +58,7 @@ clear.
   `prompt_threads` / `job_runs`, which are untouched. Hiding only
   changes what the job list endpoint returns.
 - **Redis fallback unaffected.** When Postgres is not configured the
-  list endpoint falls back to scanning `cerebrum:workflow:*` Redis
+  list endpoint falls back to scanning `amos:workflow:*` Redis
   keys; hidden flags are not enforced there because the same row falls
   out of Redis naturally as it ages.
 

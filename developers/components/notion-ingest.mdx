@@ -55,7 +55,7 @@ Everything else (`team`, `sensitivity`, `pii_spans`) flows from the connector co
 ```bash
 # from repo root
 export NOTION_TOKEN="ntn_..."
-/Users/azat/labs/cerebrum/worker/.venv/bin/python -m ingest.connectors.notion_backfill \
+/Users/azat/labs/amos/worker/.venv/bin/python -m ingest.connectors.notion_backfill \
   --workspace-slug gdi-labs \
   --hub-dir knowledge-hub \
   --user-map ingest/connectors/notion_users.yaml \
@@ -69,7 +69,7 @@ The frontmatter linter runs automatically at the end unless `--skip-lint`.
 ## Tests
 
 ```bash
-/Users/azat/labs/cerebrum/worker/.venv/bin/python -m pytest tests/test_connector_notion.py -v
+/Users/azat/labs/amos/worker/.venv/bin/python -m pytest tests/test_connector_notion.py -v
 ```
 
 Coverage includes:

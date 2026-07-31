@@ -91,10 +91,10 @@ python -m worker.scripts.seed_tool_secret \
   --tenant default \
   --secret-name aws_default \
   --ref-kind env \
-  --ref-value CEREBRUM_AWS_DEFAULT
+  --ref-value AMOS_AWS_DEFAULT
 ```
 
-…then set `CEREBRUM_AWS_DEFAULT='{"access_key_id":"...","secret_access_key":"...","region":"ap-east-1"}'`.
+…then set `AMOS_AWS_DEFAULT='{"access_key_id":"...","secret_access_key":"...","region":"ap-east-1"}'`.
 
 `SecretsManagerToolProvider` is a stub that raises `NotImplementedError`
 loudly so a premature switch in Phase 2 is loud, not silent.

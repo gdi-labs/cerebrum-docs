@@ -41,7 +41,7 @@ After the migration the column is `slug TEXT NOT NULL UNIQUE` and `name TEXT NOT
   - `_derive_public_remote` — GitHub repo path component
   - `_ensure_remote_repository` — repo name passed to `ensure_github_repository`
   - `prepare()` — local `project_dir = projects_dir / slug`
-- `VercelDeploymentManager.ensure_project` — `name=project_metadata.slug` (Vercel project names share a global team namespace, so the slug is what guarantees one Cerebrum project ↔ one Vercel project ↔ one stable production URL).
+- `VercelDeploymentManager.ensure_project` — `name=project_metadata.slug` (Vercel project names share a global team namespace, so the slug is what guarantees one Amos project ↔ one Vercel project ↔ one stable production URL).
 
 **Frontend** (`apps/frontend/lib/mother-ai-client.ts`, `apps/frontend/components/layout/footer/command-widget.tsx`, `apps/frontend/components/workflow/panels/jobs-list-panel.tsx`)
 
@@ -65,9 +65,9 @@ Mother-ai: `cargo check && cargo test` — all 12 pass.
 Frontend: `npx --no-install tsc --noEmit` clean; `pnpm run lint` clean.
 
 ```bash
-/Users/azat/labs/cerebrum/worker/.venv/bin/python -m pytest tests/
-cd /Users/azat/labs/cerebrum/mother-ai && cargo check && cargo test
-cd /Users/azat/labs/cerebrum/apps/frontend
+/Users/azat/labs/amos/worker/.venv/bin/python -m pytest tests/
+cd /Users/azat/labs/amos/mother-ai && cargo check && cargo test
+cd /Users/azat/labs/amos/apps/frontend
 npx --no-install tsc --noEmit
 pnpm run lint
 ```

@@ -1,8 +1,8 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "Cerebrum",
-  "description": "Cerebrum — an AI workforce platform from GDI Labs.",
+  "name": "Amos",
+  "description": "Amos — an AI workforce platform from GDI Labs.",
   "colors": {
     "primary": "#0D9373",
     "light": "#22C55E",
@@ -18,7 +18,7 @@
             "group": "Get Started",
             "pages": [
               "welcome",
-              "what-is-cerebrum",
+              "what-is-amos",
               "roadmap"
             ]
           },
@@ -68,7 +68,7 @@
               "developers/components/worker",
               "developers/components/ingest",
               "developers/components/frontend",
-              "developers/components/mcp-cerebrum-kb",
+              "developers/components/mcp-amos-kb",
               "developers/components/agent-workbench",
               "developers/components/connectors",
               "developers/components/diaries",
@@ -84,6 +84,16 @@
       }
     ]
   },
+  "redirects": [
+    {
+      "source": "/what-is-cerebrum",
+      "destination": "/what-is-amos"
+    },
+    {
+      "source": "/developers/components/mcp-cerebrum-kb",
+      "destination": "/developers/components/mcp-amos-kb"
+    }
+  ],
   "footer": {
     "socials": {
       "website": "https://gdilabs.io"

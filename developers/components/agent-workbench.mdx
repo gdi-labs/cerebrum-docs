@@ -1,6 +1,6 @@
 ---
 title: Agent Workbench panel
-description: The left-side workflow list in the Cerebrum dashboard (apps/frontend/components/workflow/panels/jobs-list-panel.tsx).
+description: The left-side workflow list in the Amos dashboard (apps/frontend/components/workflow/panels/jobs-list-panel.tsx).
   It is the entry point for inspecting any running, queued, or recently-completed
   workflow.
 ---
@@ -79,7 +79,7 @@ description: The left-side workflow list in the Cerebrum dashboard (apps/fronten
 - Wire-compatible: existing callers that hit `GET /v1/workflows` without
   query params still get a valid response — `limit` defaults to 20 (down
   from the prior hard cap of 200) and `next_cursor` is additive.
-- Auth follow-up: once Cerebrum auth lands, `actor.user_id` will populate
+- Auth follow-up: once Amos auth lands, `actor.user_id` will populate
   `created_by` server-side and the frontend-side defaults become a safety
   net only. The Rust `unwrap_or_else(|| "user".to_string())` at
   `routes.rs:283` will then be removed.

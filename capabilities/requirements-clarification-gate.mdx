@@ -37,7 +37,7 @@ change.
   the first level (`clarify_gate → l1_brief → scope_gate → l2_plan → …`). New
   `LevelKind` literal `clarify_requirements` in `schemas.py`.
 - **Config / env** — `WorkerConfig.clarify_requirements` (default `always`),
-  parsed from `CEREBRUM_CLARIFY_REQUIREMENTS=always|auto|never`. `main.py` stamps
+  parsed from `AMOS_CLARIFY_REQUIREMENTS=always|auto|never`. `main.py` stamps
   `is_first_prompt` into job metadata so the in-graph runner only asks on the
   first build.
 

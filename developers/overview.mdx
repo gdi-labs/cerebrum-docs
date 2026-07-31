@@ -1,6 +1,6 @@
 ---
 title: System overview
-description: Cerebrum is a queue-first AI orchestration platform. It runs a multi-agent
+description: Amos is a queue-first AI orchestration platform. It runs a multi-agent
   hierarchy against free and paid models, augmented by a retrieval-grounded knowledge
   hub, with full audit trails and per-project workspace provisioning.
 ---
@@ -17,7 +17,7 @@ description: Cerebrum is a queue-first AI orchestration platform. It runs a mult
 - **[Worker](/developers/components/worker)** — orchestrator (Python/LangGraph). Pulls jobs, runs the context engine, dispatches through an L1–L4 agent hierarchy, emits typed events.
 - **[Frontend](/developers/components/frontend)** — dashboard (Next.js / React). Renders live job streams, projects, workflows, and a 3D knowledge atlas.
 - **[Ingest](/developers/components/ingest)** — knowledge-hub pipeline. Reads markdown, chunks, embeds, upserts into Qdrant.
-- **[Knowledge Hub MCP](/developers/components/mcp-cerebrum-kb)** — read-only stdio MCP server. Exposes the knowledge hub to any MCP client (Claude Desktop, Claude Code, agents, partner tools).
+- **[Knowledge Hub MCP](/developers/components/mcp-amos-kb)** — read-only stdio MCP server. Exposes the knowledge hub to any MCP client (Claude Desktop, Claude Code, agents, partner tools).
 
 ## Core flow
 
@@ -46,6 +46,6 @@ Routing is policy-driven: housekeeping prompts → free; architecture, implement
 
 - **Submit a job**: `POST /v1/chat` returns a `job_id`. Subscribe via `GET /v1/jobs/:id/stream`.
 - **Resume an interrupted job**: `POST /v1/jobs/:id/resume` for jobs paused on an `ask_user` interrupt.
-- **Drive retrieval externally**: install the [Knowledge Hub MCP server](/developers/components/mcp-cerebrum-kb) and add it to Claude Desktop or Claude Code.
+- **Drive retrieval externally**: install the [Knowledge Hub MCP server](/developers/components/mcp-amos-kb) and add it to Claude Desktop or Claude Code.
 
 

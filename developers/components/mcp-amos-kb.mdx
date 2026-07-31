@@ -1,8 +1,8 @@
 ---
 title: Knowledge Hub MCP
-description: A read-only MCP server that exposes the Cerebrum knowledge hub to any
-  MCP client — Claude Desktop, Claude Code, partner tools, agents — through a single
-  uniform contract. The same image serves three transports; choose at runtime.
+description: A read-only MCP server that exposes the Amos knowledge hub to any MCP
+  client — Claude Desktop, Claude Code, partner tools, agents — through a single uniform
+  contract. The same image serves three transports; choose at runtime.
 ---
 
 ## Tools
@@ -14,7 +14,7 @@ description: A read-only MCP server that exposes the Cerebrum knowledge hub to a
 | `kb_list_scope(prefix?)` | List nodes under a scope prefix; omit for the full tree. |
 | `kb_node(kh_id)` | Single node plus 1-hop neighbours (`related`, `derived_from`). |
 
-The server is read-only by design. Writes go through the Cerebrum admin UI (humans) or the worker's diary writer (agents).
+The server is read-only by design. Writes go through the Amos admin UI (humans) or the worker's diary writer (agents).
 
 ## Transport
 
@@ -36,7 +36,7 @@ HTTP modes bind to `KB_MCP_BIND_HOST:KB_MCP_BIND_PORT` (default `0.0.0.0:8080`).
 | `KB_MCP_BIND_HOST` | HTTP only | `0.0.0.0` | uvicorn host. |
 | `KB_MCP_BIND_PORT` | HTTP only | `8080` | uvicorn port. |
 | `KB_MCP_AUTH_TOKEN` | HTTP recommended | — | Bearer token required on `/mcp` requests when set. |
-| `MOTHER_AI_URL` | yes | — | Cerebrum Mother AI endpoint. |
+| `MOTHER_AI_URL` | yes | — | Amos Mother AI endpoint. |
 | `MOTHER_AI_API_KEY` | depends | — | Required when Mother AI has it set. |
 | `KB_MCP_ACTOR` | no | `mcp:local` (stdio) / `mcp:cluster` (HTTP) | Per-client identifier in audit rows. |
 | `KB_MCP_TIMEOUT_S` | no | `20` | Upstream HTTP timeout. |
@@ -44,10 +44,10 @@ HTTP modes bind to `KB_MCP_BIND_HOST:KB_MCP_BIND_PORT` (default `0.0.0.0:8080`).
 
 ## Cluster deployment
 
-The `cerebrum-mcp` Terraform module (`terraform/modules/cerebrum-mcp/`) ships a Deployment + ClusterIP Service. Workers and other in-cluster tooling reach it at:
+The `amos-mcp` Terraform module (`terraform/modules/amos-mcp/`) ships a Deployment + ClusterIP Service. Workers and other in-cluster tooling reach it at:
 
 ```
-http://cerebrum-mcp.cerebrum.svc.cluster.local/mcp
+http://amos-mcp.amos.svc.cluster.local/mcp
 ```
 
 A public ingress is templated but gated by `mcp_public_enabled` (default off). When enabled it attaches to the existing ingress-nginx with per-IP rate limiting; the auth token is enforced by the server middleware, not the ingress, so token rotation only touches the K8s Secret.
@@ -55,14 +55,14 @@ A public ingress is templated but gated by `mcp_public_enabled` (default off). W
 ## Local install (stdio)
 
 ```bash
-cd mcp/cerebrum-kb
+cd mcp/amos-kb
 pip install -e .
 ```
 
 Wire into Claude Desktop via `claude_desktop_config.json`, or via Claude Code:
 
 ```bash
-claude mcp add cerebrum-kb --command cerebrum-kb-mcp
+claude mcp add amos-kb --command amos-kb-mcp
 ```
 
 ## Invariants

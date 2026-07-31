@@ -1,8 +1,9 @@
 ---
 title: External-source connectors
 description: Three CronJobs pull content from sources that live outside the curated
-  hub repo and write it into the same retrieval substrate. Notion gives Cerebrum access
-  to product docs. Slack gives it conversation context. GitHub gives it raw source...
+  hub repo and write it into the same retrieval substrate. Notion gives Amos access
+  to product docs. Slack gives it conversation context. GitHub gives it raw source
+  cod...
 ---
 
 ## Shared base
@@ -27,13 +28,13 @@ All three are time-driven CronJobs, no webhooks. The cursor does deduplication s
 
 | Connector | Schedule (default) | Why this cadence |
 | --- | --- | --- |
-| `cerebrum-notion-ingest` | `0 */2 * * *` | Docs change throughout the day; 2h is fresh enough without saturating Notion's 3 req/s rate limit. |
-| `cerebrum-slack-ingest` | `*/30 * * * *` | Conversation context loses value fast; 30m keeps "what happened earlier today" answerable. |
-| `cerebrum-github-ingest` | `0 */6 * * *` | Most repos commit a handful of times per day; HEAD-SHA cursor skips the whole repo when nothing moved. |
+| `amos-notion-ingest` | `0 */2 * * *` | Docs change throughout the day; 2h is fresh enough without saturating Notion's 3 req/s rate limit. |
+| `amos-slack-ingest` | `*/30 * * * *` | Conversation context loses value fast; 30m keeps "what happened earlier today" answerable. |
+| `amos-github-ingest` | `0 */6 * * *` | Most repos commit a handful of times per day; HEAD-SHA cursor skips the whole repo when nothing moved. |
 
 Each pod's lifecycle:
 
-1. Init container clones the curated hub into an emptyDir (same pattern as `cerebrum-hub-ingest`).
+1. Init container clones the curated hub into an emptyDir (same pattern as `amos-hub-ingest`).
 2. Main container runs `python -m ingest.run_connector --connector <name>`.
 3. The connector writes new / changed markdown into the emptyDir under `sources/<service>/...`.
 4. The same entrypoint immediately calls `ingest_hub.reindex_paths()` on the changed files, so Qdrant has the new chunks before the pod exits.
@@ -189,7 +190,7 @@ Language tag is inferred from the file extension via a table covering ~30 common
 ```json
 {
   "owner": "gdi-labs",
-  "repo": "cerebrum",
+  "repo": "amos",
   "branch": "master",
   "include_globs": ["**/*.py", "**/*.rs", "**/*.ts", "**/*.tsx", "**/*.md"],
   "exclude_globs": [".git/**", "**/node_modules/**", "**/target/**", "**/.venv/**"],
@@ -208,7 +209,7 @@ Language tag is inferred from the file extension via a table covering ~30 common
 
 - "Find the function that resolves Mother AI URLs." — literal-jargon queries where dense embeddings blur token boundaries.
 - "Where do we set the Qdrant collection name?" — config-string lookup across repos.
-- Cross-repo references: ingest `cerebrum` and `cerebrum-templates` together so workers can reason about templates while looking at how they get applied.
+- Cross-repo references: ingest `amos` and `amos-templates` together so workers can reason about templates while looking at how they get applied.
 - A motivating workload for the hybrid retrieval (BM25 + dense + RRF) work tracked next: identifier-style code tokens match literally, which is exactly where pure dense embeddings underperform.
 
 ---
@@ -220,20 +221,20 @@ Every CronJob defaults off. Per-connector knobs live in `terraform/workloads/env
 ```hcl
 notion_enabled        = true
 notion_schedule       = "0 */2 * * *"
-notion_auth_secret_id = "cerebrum/connectors/notion"
+notion_auth_secret_id = "amos/connectors/notion"
 notion_workspace_slug = "gdi-labs"
 notion_sensitivity    = "internal"
 
 slack_connector_enabled  = true
 slack_connector_schedule = "*/30 * * * *"
-slack_auth_secret_id     = "cerebrum/connectors/slack"
+slack_auth_secret_id     = "amos/connectors/slack"
 slack_workspace_host     = "gdi-labs.slack.com"
 slack_channels_json      = "[{\"id\":\"C0\",\"name\":\"general\",\"scope\":\"sources/slack/general\",\"sensitivity\":\"internal\",\"tags\":[\"company-wide\"]}]"
 
 github_connector_enabled        = true
 github_connector_schedule       = "0 */6 * * *"
-github_connector_auth_secret_id = "cerebrum/connectors/github"
-github_connector_repos_json     = "[{\"owner\":\"gdi-labs\",\"repo\":\"cerebrum\",\"branch\":\"master\", ...}]"
+github_connector_auth_secret_id = "amos/connectors/github"
+github_connector_repos_json     = "[{\"owner\":\"gdi-labs\",\"repo\":\"amos\",\"branch\":\"master\", ...}]"
 ```
 
 Tokens themselves never appear in tfvars — `*_auth_secret_id` points at an AWS Secrets Manager secret resolved at runtime via IRSA. Per-channel and per-repo policy ships as JSON in the env var (parsed by `ingest/run_connector.py`).
@@ -241,8 +242,8 @@ Tokens themselves never appear in tfvars — `*_auth_secret_id` points at an AWS
 ## Manual trigger
 
 ```bash
-kubectl -n cerebrum create job --from=cronjob/cerebrum-notion-ingest notion-once
-kubectl -n cerebrum logs job/notion-once -f
+kubectl -n amos create job --from=cronjob/amos-notion-ingest notion-once
+kubectl -n amos logs job/notion-once -f
 ```
 
 ## Invariants

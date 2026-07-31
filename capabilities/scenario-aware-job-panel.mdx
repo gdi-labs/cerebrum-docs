@@ -54,13 +54,13 @@ Manual verification:
 
 ```bash
 # Backend
-cd /Users/azat/labs/cerebrum/mother-ai && cargo check && cargo test
+cd /Users/azat/labs/amos/mother-ai && cargo check && cargo test
 # Apply the migration on dev (idempotent — the worker runs ensure_schema on boot).
-kubectl rollout restart deploy/cerebrum-worker -n cerebrum
-kubectl rollout restart deploy/mother-ai -n cerebrum
+kubectl rollout restart deploy/amos-worker -n amos
+kubectl rollout restart deploy/mother-ai -n amos
 
 # Frontend
-cd /Users/azat/labs/cerebrum/apps/frontend
+cd /Users/azat/labs/amos/apps/frontend
 npx --no-install tsc --noEmit
 pnpm run lint
 pnpm dev

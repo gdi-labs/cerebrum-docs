@@ -18,7 +18,7 @@ description: The scenarios runtime is the worker's pluggable engine for orchestr
   …). The worker compiles every loaded scenario once at startup and picks one
   per job from (in priority): ``payload.metadata["scenario_id"]`` →
   ``payload.metadata["intent_route"]`` mapped via the loader →
-  ``CEREBRUM_DEFAULT_SCENARIO``. The command widget's task type sets
+  ``AMOS_DEFAULT_SCENARIO``. The command widget's task type sets
   ``intent_route``; the future universal-input classifier will set it (or pin
   ``scenario_id`` directly) by classifying the prompt.
 * **Per-level model pinning.** Each level resolves its own `ModelConstraint`
@@ -45,7 +45,7 @@ description: The scenarios runtime is the worker's pluggable engine for orchestr
   short-circuits subsequent levels with synthetic skipped states and routes the
   gate straight to `END`. The run ends `scenario_finished status="aborted"` (a
   cap) or `"cancelled"` (a Stop); a cancelled run discards partial work — no
-  commit/push. Stop is a Redis flag (`cerebrum:job:{id}:cancel`) the worker
+  commit/push. Stop is a Redis flag (`amos:job:{id}:cancel`) the worker
   polls between levels and per tool-turn via `EventBus.is_cancelled()`.
 * **Per-tenant overrides.** A partial YAML stored in Postgres deep-merges over
   the base scenario at orchestrator construction time, so an org can tweak
@@ -64,7 +64,7 @@ All paths under `worker/worker/graph/scenarios/`:
   `escalate_now`, `confidence`, `aborted_reason`, `budget_exceeded`,
   per-level entries under `levels: dict[str, LevelState]`.
 * `scratchpad.py` — Redis-backed scenario-scoped KV
-  (`cerebrum:job:{job_id}:scratchpad`). Available to every level via the
+  (`amos:job:{job_id}:scratchpad`). Available to every level via the
   `scratchpad.{get,put,list}` intra-tools.
 * `expr.py` — Recursive-descent parser for the edge DSL. Supports paths
   (`verifier.build.passed`), string/number/bool literals, `==/!=/<,<=,>,>=`, `!`,
@@ -183,7 +183,7 @@ rubric regression beyond declared thresholds.
 * **Postgres**: one new table `tenant_scenario_overrides` (composite PK on
   `tenant_id, scenario_id`).
 * **Defaults**: `code_build` is the default scenario; override via the
-  `CEREBRUM_DEFAULT_SCENARIO` env var or per-job `scenario_id` metadata.
+  `AMOS_DEFAULT_SCENARIO` env var or per-job `scenario_id` metadata.
 * **Backwards compat**: legacy `node_started` / `node_finished` events still
   fire alongside the new `level_*` events for one release.
 
@@ -212,7 +212,7 @@ All tests live at repo root `tests/`. The scenario runtime suite:
 Run from repo root with the worker venv:
 
 ```bash
-/Users/azat/labs/cerebrum/worker/.venv/bin/python -m pytest tests/ -v
+/Users/azat/labs/amos/worker/.venv/bin/python -m pytest tests/ -v
 ```
 
 Suite status as of 2026-05-13: 502 passing, 9 unrelated pre-existing failures

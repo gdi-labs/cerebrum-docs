@@ -83,7 +83,7 @@ Outcomes:
 - `apps/frontend/components/layout/footer/command-widget.tsx` — the
   **AWS Pulse** card was removed (it was a temporary workaround
   introduced before the classifier landed). The **Task** card's
-  description now reads "Free-text prompt; Cerebrum routes it to the
+  description now reads "Free-text prompt; Amos routes it to the
   right scenario automatically".
 
 ### Follow-up prompts are classified per-prompt (2026-06-05)
@@ -194,7 +194,7 @@ composer does not.
 Run with:
 
 ```bash
-/Users/azat/labs/cerebrum/worker/.venv/bin/python -m pytest \
+/Users/azat/labs/amos/worker/.venv/bin/python -m pytest \
     tests/test_scenario_chain.py \
     tests/test_intent_classifier_load.py \
     tests/test_intent_classifier_scenario.py \

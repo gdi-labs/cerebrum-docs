@@ -65,7 +65,7 @@ sources, highest wins:
    ``task``/``qa → quick_qa``, ``research → research_brief``,
    ``security_review → security_review``. Two scenarios claiming the same
    route is a hard load error — the dispatch must be unambiguous.
-3. **Default** — ``CEREBRUM_DEFAULT_SCENARIO`` env or ``code_build``. Also
+3. **Default** — ``AMOS_DEFAULT_SCENARIO`` env or ``code_build``. Also
    the fallback when an explicit id is unknown or a route is unmapped (the
    run continues with a warning log; a misconfigured payload must never
    break the job).
@@ -301,7 +301,7 @@ A user can halt a running job from the workflow composer's Stop button
 at any step. The mechanism is a Redis flag, polled at safe points — no
 new thread, no signal handler:
 
-1. `POST /v1/jobs/:id/cancel` (mother-ai) sets `cerebrum:job:{id}:cancel`
+1. `POST /v1/jobs/:id/cancel` (mother-ai) sets `amos:job:{id}:cancel`
    (1 h TTL), marks the job terminal `cancelled` in the Redis status hash,
    and best-effort marks `prompt_threads.status='cancelled'` in Postgres —
    so the UI unsticks immediately even if no worker is holding the job.
