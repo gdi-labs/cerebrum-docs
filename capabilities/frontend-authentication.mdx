@@ -8,85 +8,170 @@ and identity was a hardcoded `azat / terry` toggle. It is now a real
 multi-user application:
 
 - **Google sign-in** for every user (Better Auth — free, open-source, MIT).
+- **Email + password sign-in** for people without a Google account (grant
+  reviewers, demo users). Sign-*up* is closed; accounts are minted by an admin.
 - **Two roles.** Admins see and manage everything; members see only their own
   workflows.
-- **Invite-only access.** A new Google account can authenticate but lands
-  *pending* — disabled until an admin approves it. The emails in
-  `ADMIN_EMAILS` are auto-promoted to admin on first sign-in (azat, terry).
+- **Invite-only access.** A new account can authenticate but lands *pending* —
+  disabled until an admin approves it. The emails in `ADMIN_EMAILS` are
+  auto-promoted to admin on first sign-in (azat, terry).
 - **Per-user monthly USD budgets**, set by admins. Once a member's
-  month-to-date spend reaches their cap, new runs are refused.
+  month-to-date spend reaches their cap, new runs are refused (HTTP 402).
 - **Account disable.** Admins can disable any account; its sessions are
   revoked immediately.
 - **An admin section** listing every user with role, status, budget, and
   month-to-date spend, plus inline controls for all of the above.
 
+## Architecture — auth does not live in the frontend
+
+This is the single most important thing to know, and the previous version of
+this document had it wrong.
+
+Better Auth, both sign-in providers, sessions, the admin plugin, budgets, and
+**all database access** live in a separate in-cluster service, `auth/` (Hono +
+Better Auth), deployed to EKS and exposed via nginx ingress at
+`https://auth.startamos.io`. The Next.js app on Vercel holds no database
+credentials for auth and has no `/api/auth/**` handler. It knows only that
+service's public URL.
+
+```
+browser ──sign-in──────────────► auth.startamos.io  (Better Auth)
+   │                                      │
+   │                                      ├── Google OAuth
+   │                                      └── cerebrum Postgres (ClusterIP only)
+   │
+   └──app──► platform.startamos.io ──/internal/preflight──► auth.startamos.io
+                  (Next BFF)
+```
+
+Two consequences that drive everything else:
+
+**1. Google only ever sees the auth service's callback.** The registered
+redirect URI is `${BETTER_AUTH_URL}/api/auth/callback/google`, derived from
+`auth_ingress_host` in terraform. App hosts never appear in Google's
+configuration, so adding or renaming a frontend host requires **no** Google
+Console change. Renaming the *auth* host does.
+
+**2. The session is a cross-subdomain cookie.** It is issued with
+`domain = BETTER_AUTH_COOKIE_DOMAIN` (`.startamos.io`), which must be a parent
+of every app host — otherwise the app never sees the session and `middleware.ts`
+bounces every request to `/login`. It also means a session created on one host
+is live on all of them.
+
+### Hosts and branches
+
+| Host | Branch | Role |
+| --- | --- | --- |
+| `platform.startamos.io` | `master` | Vercel Production; public/demo surface |
+| `next.startamos.io` | `next` | branch deployment, behind Vercel SSO |
+| `trial.startamos.io` | `stable` | not provisioned yet |
+| `auth.startamos.io` | — | the auth service, on EKS |
+
+All frontend hosts share one backend — one mother-ai, one auth service, one
+Postgres. The branch split separates frontend code only, not data. The apex
+`startamos.io` is a different Vercel project (the `amos-website` marketing
+site).
+
+### The Google OAuth client is manual, external state
+
+The client lives in **Google Cloud Console project `509857089804`**. Nothing in
+this repo can create or modify it, and the tfvars holding its id/secret is
+gitignored — so this document is the only place that records where it is.
+Changing `auth_ingress_host` therefore has a mandatory manual prerequisite:
+add `https://<new auth host>/api/auth/callback/google` to that client's
+authorized redirect URIs, and add the apex to the consent screen's authorized
+domains (which requires domain verification in Search Console). Skip it and
+every sign-in fails with `redirect_uri_mismatch`.
+
 ## What's changed
 
-All work is in `apps/frontend` plus one small change in `mother-ai`.
+**Auth service** (`auth/`)
+- `src/auth.ts` — Better Auth instance: Google + email/password providers,
+  database sessions with a 5-minute cookie cache, `admin` plugin,
+  `budgetCents` custom field, cross-subdomain cookie config, and a
+  `databaseHooks` create hook implementing the invite-only gate (new users land
+  `banned: true` / `banReason: pending_approval` unless in `ADMIN_EMAILS`).
+- `src/server.ts` — Hono app: `/healthz`, the Better Auth handler on
+  `/api/auth/*` with a CORS allowlist from `TRUSTED_ORIGINS`, and the internal
+  endpoints below.
+- `src/handlers/preflight.ts` — `GET /internal/preflight?workflow=&job=&budget=1`,
+  the one-call guard for the BFF (401 / 402 / 403 / 404 / 200).
+- `src/handlers/{users,me,admin}.ts` — batch user lookup, budget panel, and the
+  admin user table. Every admin mutation writes `auth_audit_log`.
+- `src/queries.ts` — ownership + month-to-date spend SQL.
+- Deployed by `terraform/modules/auth`; ingress and the `auth_*` variables live
+  in `terraform/modules/cerebrum-workloads`.
 
-**Auth core**
-- `lib/auth/auth.ts` — Better Auth server instance (Google provider, database
-  sessions, `admin` plugin, `budgetCents` custom field). A `databaseHooks`
-  create hook implements the invite-only gate.
-- `lib/auth/client.ts` — browser auth client. `lib/db.ts` — the frontend's
-  first Postgres connection (server-only pooled `pg`).
-- `app/api/auth/[...all]/route.ts` — Better Auth handler.
-- `lib/auth/schema.sql` — `user` / `session` / `account` / `verification`
-  tables + `auth_audit_log`. `lib/auth/backfill.sql` — one-time reassignment
-  of pre-auth workflows to the azat account.
+**Sign-in methods.** Google is open to anyone (subject to the pending-approval
+gate). Email+password has `disableSignUp: true`, so `POST /api/auth/sign-up/email`
+is closed to the public — accounts come from the admin plugin's `createUser`,
+land banned like any other new user, and are enabled via
+`PATCH /admin/users/:id`. `/sign-in/email` is rate-limited to 10 attempts per
+15 minutes. The frontend's `NEXT_PUBLIC_ENABLE_PASSWORD_LOGIN` controls only
+whether the *form renders*; the endpoint is enabled service-wide and reachable
+from any origin.
 
-**Route protection**
-- `middleware.ts` — optimistic cookie gate on page routes.
+**Frontend** (`apps/frontend`) — no database access, no auth secrets.
+- `lib/auth/client.ts` — browser Better Auth client pointed at
+  `NEXT_PUBLIC_AUTH_BASE_URL`, with the admin client plugin.
 - `lib/auth/guards.ts` — `requireUser` / `requireAdmin` (pages) and
-  `requireApiUser` / `requireApiAdmin` (route handlers).
-- Route group `app/(authenticated)/` holds the app chrome and a server-side
-  `requireUser()` gate; `app/(authenticated)/admin/` adds `requireAdmin()`.
-  `/login` renders outside the group.
-- Every `app/api/**` BFF route is guarded — mother-ai routes via the shared
-  proxy, the rest with explicit guards.
+  `requireApiUser` / `requireApiAdmin` (route handlers); all resolve identity by
+  forwarding the session cookie to `/internal/preflight`.
+- `lib/auth/access.ts` — `requireAccess()` (the single-round-trip guard) and
+  `proxyToAuthService()` for `/api/admin/*` and `/api/me/budget`.
+- `lib/auth/workflow-scope.ts` — `stampActor` forces `created_by` from the
+  session server-side; `requireWorkflowAccess` / `requireJobAccess` enforce
+  ownership (admins bypass).
+- `middleware.ts` — optimistic cookie gate on page routes.
+- `app/(authenticated)/` — app chrome behind a server-side `requireUser()`;
+  `app/login/` renders outside it.
 
-**Per-user scoping**
-- `mother-ai`: `GET /v1/workflows` gained an optional `created_by` filter
-  (`src/routes.rs`, `src/models.rs`).
-- `lib/auth/workflow-scope.ts` — `stampActor` writes identity onto outbound
-  payloads server-side; `requireWorkflowAccess` / `requireJobAccess` enforce
-  ownership via indexed reads on `workflow_runs` / `job_runs`.
+**mother-ai** — `GET /v1/workflows` has an optional `created_by` filter
+(`src/routes.rs`, `src/models.rs`). Additive.
 
-**Budgets & admin**
-- `lib/auth/budget.ts` — month-to-date spend from `job_runs.cost_usd`;
-  `enforceBudget` preflights BFF write routes (HTTP 402 over budget).
-- `GET /api/me/budget` feeds the settings panel.
-- `lib/auth/admin.ts`, `app/api/admin/users/**`, and
-  `app/(authenticated)/admin/users/` — the user-management surface; every
-  mutation is written to `auth_audit_log`.
-
-**New env vars** (`apps/frontend/.env.example`): `DATABASE_URL`,
-`BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `GOOGLE_CLIENT_ID`,
-`GOOGLE_CLIENT_SECRET`, `ADMIN_EMAILS`, `DEFAULT_BUDGET_USD`.
+**Env vars.** Frontend (`apps/frontend/.env.example`): `AUTH_BASE_URL`,
+`NEXT_PUBLIC_AUTH_BASE_URL`, `NEXT_PUBLIC_APP_BASE_URL`,
+`NEXT_PUBLIC_ENABLE_PASSWORD_LOGIN`. Auth service (via
+`terraform/modules/auth`, from the `auth_*` tfvars): `DATABASE_URL`,
+`BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `BETTER_AUTH_COOKIE_DOMAIN`,
+`TRUSTED_ORIGINS`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `ADMIN_EMAILS`,
+`DEFAULT_BUDGET_USD`, `BANNED_REDIRECT_URL`.
 
 ## Impact scope
 
-- **Frontend** — auth is required everywhere; the fake `azat / terry` toggle
-  is gone. The frontend now holds a Postgres connection (server-side only).
-- **mother-ai** — additive only: a new optional query param, fully
-  backwards-compatible. It keeps its API-key auth; the Next.js BFF is the
-  per-user trust boundary (the browser cannot reach mother-ai directly).
-- **worker / infra** — unchanged. Auth tables live in the existing Postgres.
-- **Not backwards-compatible:** the app cannot be used signed-out. Pre-auth
-  workflows must be reassigned with `lib/auth/backfill.sql` after azat's first
-  sign-in, or their owner won't see them.
+- **Frontend** — auth is required everywhere. It holds no database credential
+  for auth; a misconfigured `AUTH_BASE_URL` degrades to *looks logged out*
+  (page guards return `null` → `redirect("/login")`), while API routes fail
+  loudly with 500/502. Worth knowing during a domain cutover.
+- **auth service** — the trust boundary. `TRUSTED_ORIGINS` is a comma-separated
+  string feeding both Better Auth and Hono CORS; a missing origin fails at the
+  preflight, not at sign-in. `BANNED_REDIRECT_URL` is a single value, so banned
+  users from any host land on the canonical host's `/login`.
+- **mother-ai** — backwards-compatible. It keeps API-key auth; the Next BFF is
+  the per-user trust boundary (the browser cannot reach it directly).
+- **worker / infra** — unchanged. Auth tables live in the existing Postgres,
+  which stays ClusterIP-only.
+- **Operational gotcha:** the auth env arrives via `envFrom.secretRef`, so a
+  `terraform apply` updates the Secret but the pod keeps stale values until
+  `kubectl rollout restart deployment/auth -n cerebrum`.
 - **Defaults:** new users are disabled until approved; budgets default to
-  `DEFAULT_BUDGET_USD`; admins are exempt from budget enforcement. The budget
-  cap is *soft* — checked at submission, so a running job can still overshoot.
+  `DEFAULT_BUDGET_USD` (25); admins are exempt from budget enforcement. The cap
+  is *soft* — checked at submission, so a running job can still overshoot.
 
 ## Tests
 
+- Auth service: `cd auth && npx --no-install tsc --noEmit`.
 - Frontend: `cd apps/frontend && npx --no-install tsc --noEmit`,
   `npx --no-install biome check .`, `pnpm build`.
 - mother-ai: `cd mother-ai && cargo check && cargo test`.
-- Worker suite (`tests/`) is unaffected — auth is frontend-side.
-- End-to-end (manual, needs `DATABASE_URL` + Google OAuth configured): sign in
-  as a non-admin → pending screen; sign in as an `ADMIN_EMAILS` account →
-  full access; approve the pending user; create workflows as two users and
-  confirm each sees only their own; drop a budget and confirm a 402; disable a
-  user and confirm the session is revoked.
+- Worker suite (`tests/`) is unaffected — auth is not in the worker path.
+- End-to-end (manual): sign in with Google as a non-admin → pending screen;
+  as an `ADMIN_EMAILS` account → full access; approve the pending user; create
+  workflows as two users and confirm each sees only their own; drop a budget and
+  confirm a 402; disable a user and confirm the session is revoked.
+- End-to-end (password path): confirm `POST /api/auth/sign-up/email` returns
+  4xx (sign-up closed); confirm repeated bad passwords on `/sign-in/email`
+  return 429; sign in as the seeded account and confirm it reaches `/u` and is
+  denied `/admin`.
+- Cross-host: sign in on one app host, open another, confirm the session is
+  already live (shared parent-domain cookie).
