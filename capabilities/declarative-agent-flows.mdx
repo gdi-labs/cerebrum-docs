@@ -10,6 +10,7 @@ description: 'Amos runs every paid job through a scenario: a versioned YAML file
 | Concern                       | YAML field                                  |
 |------------------------------|---------------------------------------------|
 | Sequence of levels            | `levels: [...]` (ordered, ids unique)       |
+| How a step reads in the UI    | `display_name: Confirm scope` + `description: <one line>` (presentation-only) |
 | Branching                     | `edges: [{from, to, when}]` with a typed boolean DSL |
 | Parallel children             | `kind: aggregator` + `fan_out: [...]` + `fan_in.aggregator: <name>` |
 | Human gate                    | `kind: human_approval` + `prompt_ref` + `metadata.approver_role` |
@@ -42,6 +43,42 @@ description: 'Amos runs every paid job through a scenario: a versioned YAML file
   the base at orchestrator construction time, so a customer can tune
   budgets / constraints / verifier weights without forking the base
   scenario.
+* **A run canvas that reads as a flow**: the compiled DAG ships inside
+  `scenario_started`, so the decision graph lays itself out before the
+  first level runs. See below for what the layout does with it.
+
+## How the run canvas reads a scenario
+
+`AgentFlowGraph` (`apps/frontend/components/workflow/graph/`) turns the
+topology into an actor-lane grid: one column per role tier (`L1`, `L2`,
+…, in first-appearance order), levels owned by the same actor stacked
+inside it. Three rules make a live run legible:
+
+* **Named steps.** A level's `display_name` sits under the actor on the
+  card and next to it in the activity timeline, in the slot the raw level
+  id used to own — so `code_build` reads "TEAM LEAD · Write the brief"
+  rather than a second indistinguishable "Team Lead". `description` is
+  the card's hover tooltip and the timeline's second line, where it
+  doubles as the disclosure toggle for that step's live output.
+  `description` is truncated to 160 chars on the wire to keep the
+  topology payload ~1 KB.
+* **Dead branches lift out of the way.** Levels the run never visited are
+  placed on negative rows — the band *above* the spine — so an unfired
+  branch like `l2_escalate` stops sitting between `l2_plan` and the edge
+  that routes around it. A level alone in its lane (the synthetic
+  `L0.router` placeholder) stays on the spine. Skipped status is only
+  known at runtime, so this resolves once, when the run terminates and
+  the still-`planned` levels flip to `skipped`; the nodes glide rather
+  than jump.
+* **Edges enter the right face, and only the ambiguous ones are
+  arrowed.** An edge whose source sits *lower* than its target enters
+  through the target's bottom face rather than its side, so retries and
+  escalations don't cut horizontally across the rows between them; a
+  backward edge between two lanes on the same row loops underneath
+  instead of sharing a gutter with the forward edge. Forward flow — left
+  to right across lanes, top to bottom within one — carries no
+  arrowhead, since the layout already says which way it runs. Only the
+  edges that double back get one, tinted to match their live state.
 
 ## What's bundled
 
