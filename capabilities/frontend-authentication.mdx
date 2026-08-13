@@ -109,7 +109,35 @@ land banned like any other new user, and are enabled via
 `PATCH /admin/users/:id`. `/sign-in/email` is rate-limited to 10 attempts per
 15 minutes. The frontend's `NEXT_PUBLIC_ENABLE_PASSWORD_LOGIN` controls only
 whether the *form renders*; the endpoint is enabled service-wide and reachable
-from any origin.
+from any origin. On `/login` the form is collapsed behind a lock-icon toggle
+beside the Google button.
+
+### Seeding a credential account
+
+`authClient.admin.createUser` (from an admin browser session) is the normal
+path. When no browser session is available — scripted setup, or seeding before
+anyone can sign in — insert the rows directly, but **generate the hash with
+Better Auth's own crypto** so the format is guaranteed to match:
+
+```bash
+kubectl exec -n cerebrum deploy/auth -- node -e '
+import("better-auth/crypto").then(async m => console.log(await m.hashPassword("<password>")))'
+```
+
+Then insert a `user` row plus an `account` row with `providerId = 'credential'`,
+`accountId = <the user id>`, and `password = <that hash>`. Direct inserts
+**bypass the `databaseHooks` create hook**, so set `role`, `banned`,
+`banReason`, and `budgetCents` explicitly — the hook would otherwise have
+banned the account pending approval.
+
+Size `budgetCents` from measured spend, not a guess: as of 2026-08 across 229
+workflows the average was $0.95, p90 $3.42, and the most expensive single
+workflow ever was $16. A reviewer/demo account sits at $50 — comfortably clear
+of a 402 mid-demo while still capping the blast radius of a shared credential
+on a public endpoint. Adjust in `/admin`.
+
+Credentials themselves are never recorded in this repo. A live demo account
+exists for grant/reviewer access; its password is held outside version control.
 
 **Frontend** (`apps/frontend`) — no database access, no auth secrets.
 - `lib/auth/client.ts` — browser Better Auth client pointed at
