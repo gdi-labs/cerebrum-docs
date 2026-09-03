@@ -1,0 +1,179 @@
+---
+title: Composer model and effort pickers
+description: '## What it enables'
+---
+
+The chat composer now shows **what is actually selected**. Before, both footer
+controls were static labels: the model trigger read "Routing picks the cheapest
+capable model" and the effort trigger read "Reasoning effort" no matter what
+was picked, because the shared `Select` renders its `title` prop *instead of*
+the selected value. A screen reader announced those sentences as the value.
+
+Concretely:
+
+- **A model reads as a product, not a wire identifier.** Rows were
+  `anthropic · claude-haiku-4-5-20251001`; they are now "Claude Haiku 4.5" with
+  the Anthropic mark beside it. The longest string in a row is no longer a
+  release date nobody chooses a model by, and the provider is no longer
+  repeated on every row of that provider.
+- **Provider brand marks** identify who made the model at a glance. For a
+  router-served model the *maker's* mark is drawn, not the router's:
+  `minimax/minimax-m3:free` is served by OpenRouter and wears the MiniMax mark,
+  because that is the one a person recognises. Who serves it survives in the
+  row's cost-tier hint and the trigger's tooltip.
+- **The effort trigger shows the current rung** behind a brain icon, and
+  disables itself with an explanation when the pinned model has no thinking
+  control.
+- **Free models are badged**, driven by `cost_tier === "free"` rather than by a
+  `:free` suffix — so `openai/gpt-oss-120b` on Groq is badged too, despite
+  having no tag in its id.
+- **The footer animates as one system**: menus grow open and shrink closed from
+  their own trigger, the chevron rotates, the `+` attach icon turns 45° into a ×
+  while its menu is open, and send↔stop trade places in a fixed box instead of
+  swapping instantly. Every one of these collapses to no animation under
+  `prefers-reduced-motion`. Every menu in the app gains the open/close
+  animation, not just the composers' — one implementation, so a menu 30px away
+  from another cannot animate differently.
+
+The second composer (New Initiative / declare-a-work-item) got the same
+treatment **plus a data fix**: its roster was hardcoded to `qwen3:14b` and a
+permanently disabled `claude-opus-4-8`, and its effort ladder offered an
+`extra_high` rung that exists in no catalog and no worker. It now reads the
+same catalog as the chat composer.
+
+## What's changed
+
+New:
+
+- `apps/frontend/components/ui/icon-select.tsx` — the picker. A Radix
+  DropdownMenu + RadioGroup whose trigger renders an icon plus the current
+  value. Item API is `{ value, label, icon?, disabled?, badge?, hint? }`.
+  `components/ui/select.tsx` is deliberately untouched: its `title` prop
+  replaces the value display, and widening it to a ReactNode would break that
+  prop's meaning at its seven other call sites, several of which are real form
+  controls with `name`/`required`.
+- `apps/frontend/components/icons/provider-icon.tsx` — `ProviderIcon` and
+  `modelBrand()`. Marks come from `@lobehub/icons`, imported by **deep path**
+  (`@lobehub/icons/es/<Brand>/components/Mono`). That is load-bearing: the
+  package index and its own `ProviderIcon`/`ModelIcon`/`Combine`/`Avatar`
+  helpers pull in `@lobehub/ui` and `antd-style`, which peer on `antd ^6`, so
+  one barrel import would add Ant Design to the client bundle. The Mono leaves
+  import nothing but React, render `fill="currentColor"`, and ship `.d.ts`. The
+  mark map is `Record<KnownModelProvider, …>`, mirroring `PROVIDER_COLORS`, so
+  a provider added to that union is a compile error until it has a mark.
+
+Changed:
+
+- `apps/frontend/lib/models/catalog-client.ts` — adds `EFFORT_LABELS` and the
+  pure `modelDisplayName(id)`. It strips the vendor path prefix, a `:free` tag,
+  a trailing 8-digit snapshot stamp, then title-cases with a brand-word map
+  (`deepseek` → DeepSeek, `oss` → OSS, `glm` → GLM). Unknown ids degrade to
+  title case rather than throwing, so a model added to
+  `config/model_catalog.yaml` still appears without a frontend release.
+- `apps/frontend/components/ui/dropdown-menu.tsx` — `MENU_SPRING` (for the
+  trigger affordances), `DropdownRadioGroup`/`DropdownRadioItem`/
+  `DropdownItemIndicator`, and a `menu-animated` class on every
+  `DropdownContent`.
+- `apps/frontend/app/globals.css` — the `menu-in`/`menu-out` keyframes and
+  `.menu-animated`, keyed off Radix's own `data-state`.
+
+  This is worth knowing before anyone "improves" it. The first attempt animated
+  the menu with framer-motion, which needs `Portal forceMount` +
+  `AnimatePresence` + `asChild` to get an exit animation at all — Radix
+  unmounts `Content` the instant `open` flips false. **The menu rendered
+  invisible**: `asChild` replaces Radix's popper content element with a
+  `motion.div`, and that element is what carries the positioning styles, the
+  computed z-index Radix copies onto its wrapper, and the `--radix-popper-*`
+  vars. CSS needs none of it — Radix's `Presence` already delays unmounting
+  until a running CSS animation ends. The cost is a cubic-bezier instead of a
+  spring, which is imperceptible over 160ms.
+- `apps/frontend/components/workflow/panels/workflow-prompt-composer.tsx` and
+  `apps/frontend/components/initiatives/initiative-composer.tsx` — both
+  pickers, the `+` rotate, and (chat composer only) the send↔stop swap.
+- `apps/frontend/lib/models/catalog-client.test.ts` — 21 new cases.
+- `apps/frontend/package.json` — adds `@lobehub/icons`.
+
+No env vars, endpoints, Terraform resources or CronJobs change. No backend
+change: the display names are computed client-side rather than added to
+`config/model_catalog.yaml`, precisely so a catalog row stays the only thing
+needed to add a model.
+
+## Impact scope
+
+- **Backwards-compatible where it counts.** `DropdownContent`'s props are
+  unchanged, so the four existing menus elsewhere in the app needed no edit —
+  they pick up the open/close animation and nothing else.
+  `components/ui/select.tsx` and its other call sites are untouched. The
+  `InitiativeComposer` `onSubmit` contract is unchanged, so neither of its two
+  callers needed an edit (both destructure only `goal`).
+- **One payload change, deliberate.** `effort` is now derived: if the pinned
+  model's ladder does not define the current rung, the request carries the
+  nearest rung it does define — `none` instead of `high` for Claude Haiku 4.5,
+  `medium` instead of `high` for Sonnet 4.6. The worker already rounded these
+  down, so no output changes; the request is simply now honest about what it
+  asked for. A trigger that displays the value cannot keep hiding the mismatch
+  the static label hid.
+- **Accessibility class change.** Both pickers are now `menu` +
+  `menuitemradio` rather than `combobox`/`listbox`. They lose implicit form
+  participation (neither composer submits inside a `<form>`) and gain a trigger
+  whose text *is* the value, replacing a static sentence that a screen reader
+  read as the value. Roving focus, typeahead, Home/End, Escape and focus-return
+  all still come from Radix. `modal={false}` is set on purpose: the modal path
+  `aria-hidden`s the rest of the app, locks body scroll and disables outside
+  pointer events, all wrong for a toolbar control inside a scrolling chat
+  panel.
+- **Degradation.** If `GET /api/v1/models` fails, `selectableChatModels`
+  returns `[]` and both pickers show Auto alone, with the full effort ladder.
+  For the initiative composer that is strictly better than the fake roster it
+  used to show.
+- **Dependency weight.** `pnpm add @lobehub/icons` pulls `antd` and
+  `@lobehub/ui` into `node_modules` as transitive/peer installs. Bundle impact
+  is zero — nothing imports them, so nothing is traced. Do not add an
+  `.npmrc` with `auto-install-peers=false` to prevent it: `@lobehub/ui` is a
+  *dependency* of the icons package, not a peer, so it would not work, and it
+  would flip resolution for `echarts-for-react`, `@react-three/*` and
+  `react-force-graph-*`, which do rely on peer auto-install. If install size
+  ever matters, vendor the ten Mono SVGs locally instead — `ProviderIcon`'s
+  API is identical either way.
+
+## Tests
+
+Unit (vitest, `environment: "node"` — no jsdom or RTL, so the pure helper is
+what is testable):
+
+```bash
+cd apps/frontend
+/Users/azat/Library/pnpm/pnpm test                    # 277 pass, incl. 21 new
+npx --no-install vitest run lib/models                # just this area
+npx --no-install tsc --noEmit                         # clean
+/Users/azat/Library/pnpm/pnpm run lint
+```
+
+The new cases cover `modelDisplayName` against every chat model id in
+`config/model_catalog.yaml`, the property that a `:free` variant renders
+identically to its paid original (which is what makes `cost_tier`, not the tag,
+the badge's source of truth), degradation on an unseen id, and that
+`EFFORT_LABELS` has a label for every rung a picker can offer.
+
+Pre-existing lint failures, **not** regressions from this work:
+`app/icon.svg` (`a11y/noSvgWithoutTitle`) and `lib/voice/stt/server.ts`
+(formatter), both on the `voice-control` branch and untouched here.
+
+Manual, in the browser (the widget appears on the initiative chat tab and in
+the job context panel footer):
+
+1. **Open both menus and confirm the surface is visible** — this is the check
+   the framer-motion attempt failed, and nothing in the type-checker or the
+   test suite catches it.
+2. Pin one model per provider; the trigger mirrors its mark and name.
+3. Pin `claude-haiku-4-5-20251001`; the effort trigger disables, reads "None",
+   and still shows "…has no thinking control" on hover — the tooltip is on a
+   wrapper, not the disabled button, because a disabled button does not fire
+   pointer events in every browser.
+4. Escape mid-open-animation, and click mid-exit: neither should land on a
+   half-gone row (`.menu-animated[data-state="closed"]` sets
+   `pointer-events: none`).
+5. Toggle OS reduce-motion: no animation, menus still open and dismiss.
+6. Start a run and watch send→stop trade places with no row jump.
+7. Open an unrelated menu (the project header, the jobs row) — they share
+   `DropdownContent`, so they animate now too and should look right.

@@ -1,21 +1,88 @@
 ---
 title: Free and paid models, together
-description: Amos doesn't ask you to pick a model upfront. It picks per step, balancing
-  cost against the difficulty of the work.
+description: Amos doesn't ask you to pick a model upfront. It picks per step, and
+  it picks by what the step needs rather than by vendor name.
 ---
 
-## When free models work
+## Capability first, price second
 
-Routine work — classifying a prompt, drafting a plan, verifying a result — runs on free local models. They're fast, cost nothing per call, and run on your own hardware. For reasoning-heavy classification, the platform uses thinking-tuned local models.
+Each kind of work states a requirement, and the catalog answers with whatever
+can meet it, cheapest capable first:
 
-## When paid models earn their cost
+| Work | What it asks for |
+| --- | --- |
+| Long-context reading | a 200K+ window |
+| Hard reasoning | a model that can think, at a high effort rung |
+| Implementation | native tool calling |
+| Anything with an image or a recording | vision, or audio input |
+| Quick classification | no thinking at all, free tier acceptable |
 
-Architecture work, implementation, and high-risk decisions go to paid models — Claude, OpenAI, and other OpenAI-compatible endpoints. Routing is policy-driven; you decide which categories of work go where.
+The order matters and is not a preference: a cheaper model that cannot do the
+work is not a saving. Requirements are never traded away for price — if only an
+expensive model can meet them, the work goes there.
 
-## Fallback that just works
+## Ten providers, one contract
 
-Every paid provider has a health score. When one fails — rate limit, outage, malformed response — the platform de-prefers it for subsequent jobs and falls through to the next provider on your list. You don't need to write retry code; the platform handles it.
+Claude, OpenAI, DeepSeek, GLM (Zhipu), Kimi (Moonshot), MiniMax, plus the Groq
+and OpenRouter routers. Adding one is a row in
+`config/model_catalog.yaml` — ten of the eleven speak the same HTTP shape, so a
+new vendor usually needs no code at all.
+
+Cost tiers are `free → cheap → mid → frontier`, and cheap is roughly a tenth of
+frontier for reasoning-heavy work. That is where the saving comes from: bulk
+implementation and reasoning prefer cheap, and only the steps that need a
+frontier model get one.
+
+## How hard to think, portably
+
+Every vendor spells reasoning differently — a token budget, an enum, a boolean
+switch. Amos exposes one ladder, `none → low → medium → high → max`, and
+translates. A level asks for `high` and gets it whether it lands on Claude
+(a thinking budget), DeepSeek (`reasoning_effort`), or GLM (a switch that is
+simply on).
+
+Effort is a **floor**: a model that doesn't define the requested rung rounds
+*up* to the next one it has, because a level asking to think harder should
+never be answered with less. `none` is the one exception — it is a ceiling, and
+never rounds up.
+
+## Free means quota, not hardware
+
+"Free" used to mean our own GPU. It now means hosted free tiers, which fail by
+*refusing* rather than by billing — so they need pacing, not a budget. A shared
+Redis ledger tracks requests and tokens per window across every worker, because
+several workers each keeping their own count would burn a 50-a-day cap in
+minutes while each believed it had plenty left.
+
+A free model whose window is spent is **skipped, not tried**: the point is to
+avoid the 429, not to survive it. And a free candidate is admitted on
+capability before price is considered at all — "it's free" is never a reason to
+run work on a model that cannot do it.
+
+## Fallback that knows why it failed
+
+Every provider has a health score, and failures decay: one bad afternoon no
+longer de-prefers a provider forever. Three failures are told apart, because
+the right response differs:
+
+- **A spent quota** skips that model until its window rolls. Not a health
+  failure — the provider is fine, we simply asked too often.
+- **An unfunded account** (a valid key with a zero balance) says so by name.
+  No amount of retrying fixes it; an operator has to add funds. Vendors report
+  this inconsistently — one sends 402, another sends 429 — so the body is read
+  rather than the status code.
+- **A missing capability** is refused before the call, naming the model and the
+  feature it lacks, instead of arriving as a provider 400 or a confident answer
+  about an attachment the model never received.
 
 ## Per-call cost tracking
 
-Every paid call is recorded with model, token counts, and cost. You can see what each job cost, broken down by model and step. The dashboard surfaces this per project so you know exactly where spend is going.
+Every call records provider, model, token counts and cost — plus the effort
+rung it asked for and the reasoning tokens that rung consumed, so "was thinking
+harder worth it" is answerable rather than a matter of opinion. Media is
+recorded by reference and content hash, never as bytes.
+
+Prices live in the catalog, which refuses to load a paid model with no price:
+every OpenAI and Gemini call in this system recorded $0.00 for months because a
+lookup defaulted to zero, and a cost dashboard that quietly lies is worse than
+one that fails to start.

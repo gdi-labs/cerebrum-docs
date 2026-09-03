@@ -39,8 +39,14 @@ Routing is policy-driven: housekeeping prompts → free; architecture, implement
 
 ## Models
 
-- **Free**: Ollama-served models (local or remote), woken on demand.
-- **Paid**: Claude and OpenAI-compatible endpoints. Health-ranked provider fallback de-prefers failing providers automatically.
+Which models exist and what they can do is **data**, in `config/model_catalog.yaml`; whether a team may use one is `config/team_controls.yaml`. Neither is a code change, and `GET /v1/models` serves the merged answer.
+
+- **Free**: hosted free tiers, reached through the Groq and OpenRouter routers (`openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `minimax/minimax-m3:free`, `z-ai/glm-5.2:free`). Free means a *quota*, not free hardware — these fail by refusing, so a shared Redis ledger paces them across workers and a model whose window is spent is skipped rather than tried.
+- **Paid**: Claude (`claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`), DeepSeek (`deepseek-v4-flash`, `deepseek-v4-pro`), GLM (`glm-5.2`), Kimi (`kimi-k3`), MiniMax (`minimax-m3`). Ten of the eleven providers speak the same HTTP shape, so adding one is usually a catalog row and no code.
+- **Cost tiers** are `free → cheap → mid → frontier`, and selection is cheapest *capable* first — a cheaper model that cannot do the work is not a saving.
+- **Provider fallback** is health-ranked, and tells a spent quota, an unfunded account and a missing capability apart, because the right response to each differs.
+
+Self-hosted inference (the Ollama stack and its GPU node) is **being retired** — it is no longer a model source anything routes to on purpose.
 
 ## Integrate
 

@@ -1,0 +1,216 @@
+---
+title: Internationalization (English + Simplified Chinese)
+description: '## What it enables'
+---
+
+The Command Center used to be English-only, with every user-facing string
+hardcoded inline and `<html lang="en">` fixed in the root layout. It now serves
+two languages and is built to take more:
+
+- Every page is reachable per-language at a short, shareable URL — `/en/atlas`
+  and `/cn/atlas`. A link pins its language, so sharing a page shares the
+  language it was read in.
+- A **language dropdown in the header** — sitting with the alerts and settings
+  controls — switches between English and 简体中文 **without leaving the current
+  page**, preserving query parameters, and remembers the choice for later visits
+  to unprefixed URLs. Its trigger shows the language you'd switch *to* (`EN` in
+  a Chinese UI, `中文` in an English one), so the way out stays legible to
+  someone who can't read what's currently on screen.
+- First-time visitors are matched on `Accept-Language`: a browser asking for
+  `zh-CN` (or any `zh-*`) lands on `/cn`; anything else falls back to English.
+- Numbers, dates, currency and weekday names follow the active language, so a
+  Chinese page reads `1.2万` and `8月18日` rather than `12K` and `August 18`.
+- **Adding a third language is a three-file change** (below), and the test
+  suite fails until all of it is done.
+
+Scope of this first pass is the app **shell**: navigation, header controls,
+admin section tabs, the settings panel, the login page, both not-found
+boundaries, and page titles. Feature-page copy is still English and migrates
+incrementally behind the same pattern.
+
+## The slug ↔ language-tag split
+
+Each language carries **two** identifiers, and conflating them is the trap this
+design exists to avoid:
+
+| | English | Chinese |
+| --- | --- | --- |
+| URL prefix / message filename (**slug**) | `en` | `cn` |
+| Internal locale, `<html lang>`, `Intl` (**tag**) | `en` | `zh-Hans` |
+
+`cn` cannot also be the locale tag, because it is not a language — it is
+China's *region* code, and the language is `zh`. `Intl` does not throw on an
+unknown-but-well-formed tag; it silently falls back:
+
+```
+new Intl.NumberFormat("cn")      → resolves to en-US → "12K"    ← wrong, silent
+new Intl.NumberFormat("zh-Hans") → resolves to zh-Hans → "1.2万"  ← correct
+```
+
+So a fully-Chinese UI would render English-style numbers and dates with nothing
+in the console. `<html lang="cn">` is likewise wrong for screen readers and
+browser translation.
+
+next-intl bridges the two via `localePrefix.prefixes`; custom prefixes are
+visible only in the URL and are rewritten internally to the locale tag.
+`lib/i18n/config.ts` is the single registry tying slug, tag and display label
+together, and `lib/i18n/config.test.ts` asserts every tag survives an `Intl`
+round-trip — the test that would have caught `cn`.
+
+## What's changed
+
+### New — `apps/frontend/lib/i18n/`
+| File | Role |
+| --- | --- |
+| `config.ts` | The locale registry: `LOCALES`, `DEFAULT_LOCALE`, `LOCALE_SLUGS`, `LOCALE_LABELS`, `LOCALE_PREFIXES` |
+| `routing.ts` | `defineRouting` — always-prefixed, `/cn` custom prefix, one-year locale cookie, `alternateLinks: false` |
+| `request.ts` | Per-request config; loads `messages/<slug>.json`, pins `timeZone` and `now` |
+| `navigation.ts` | `Link`, `redirect`, `usePathname`, `useRouter`, `getPathname` |
+| `path.ts` | `splitLocaleSlug` / `withSlug` — the only slug↔tag conversion outside next-intl |
+
+### New elsewhere
+- `apps/frontend/messages/{en,cn}.json` — the catalogs, namespaced by area.
+- `apps/frontend/global.d.ts` — augments next-intl's `AppConfig` so message keys
+  are typed against `en.json`; a bad key is a `tsc` error, not a silent fallback.
+- `apps/frontend/proxy.ts` — replaces `middleware.ts` (see below).
+- `apps/frontend/components/layout/header/language-dropdown.tsx` — the switcher.
+  Lived at `panels/language-select.tsx` as a settings row until 2026-08-19, when
+  it moved into the header and became a dropdown of its own.
+- `app/[locale]/not-found.tsx` and `app/[locale]/(authenticated)/not-found.tsx`.
+
+### Restructured
+- **All 20 pages moved under `app/[locale]/`.** `app/layout.tsx` is **deleted**;
+  `app/[locale]/layout.tsx` is now the root layout and owns `<html lang>`. A
+  layout above the `[locale]` segment gets no params, so it could not source the
+  language from the route. Verified against Next's own loader that this is safe:
+  the root-layout requirement is checked per page along that page's path, and
+  route handlers bypass the layout tree entirely.
+- **`middleware.ts` → `proxy.ts`.** Next 16.1.6 warns that the `middleware`
+  filename is deprecated; the rename does not change the runtime (both compile
+  into the Node server bundle). It now runs locale routing *first*, then the
+  existing better-auth cookie gate against the slug-stripped path.
+- **`next.config.ts`** — wrapped in `createNextIntlPlugin("./lib/i18n/request.ts")`,
+  plus a `/:slug(en|cn)/knowledge → /:slug/atlas` rule alongside the bare one.
+- **`apps/frontend/biome.json`** — a `noRestrictedImports` rule banning
+  `next/link` and `next/navigation`'s `useRouter`/`usePathname`/`redirect`.
+
+### No infra change
+The frontend deploys via Vercel's git integration; no ingress or Terraform path
+rules front it. `auth_banned_redirect_url` and the auth service's
+`BANNED_REDIRECT_URL` stay as they are — a request to the unprefixed `/login` is
+forwarded to `/en/login` with query parameters intact. Meta's OAuth redirect URI
+`/api/meta/callback` stays unprefixed, which is why `/api` remains excluded from
+the proxy matcher.
+
+## Impact scope
+
+**Backwards compatible.** Old bookmarks and inbound links keep working — every
+unprefixed path 307s to the detected locale. `/api/**` is untouched: all 64
+route handlers stay unprefixed and unredirected.
+
+**Nothing defaults to off.** Locale detection is on, so a `zh-*` browser gets
+Chinese immediately — including the machine-translated copy noted below.
+
+The invisible-by-design part is navigation. `usePathname()` from
+`lib/i18n/navigation` returns the pathname with the slug **stripped**, and
+`Link`/`useRouter` re-add it. That is why every bare href (`/admin`,
+`/initiatives/${id}`) and every path comparison — `lib/immersive/routes.ts`,
+`layout-chrome.tsx`, `audit-tape-chrome.tsx`, `app-header.tsx`'s `isActive`,
+`admin/section-tabs.tsx` — kept working with **only their imports changed**.
+Anything reading a path must therefore keep receiving a slug-stripped one;
+`lib/immersive/routes.test.ts` pins that contract.
+
+**Known gaps, deliberate:**
+- **zh-Hans copy is a machine-translated first pass**, flagged
+  `_meta.reviewed: false` in `messages/cn.json`. It needs a human editing pass.
+- **Backend and LLM prose stays English.** The `mother-ai` service supplies
+  `blurb` / `summary` / `detail` / `message` and all markdown job output, which
+  renders as-is. Localizing it needs a locale contract with the backend; sending
+  `Accept-Language` from the proxy routes is the natural first step.
+- **Feature-page copy is still English** (~1,250 strings), as are the demo
+  fixtures in `lib/command-center/mock-data.ts` and `lib/atlas/mock-data.ts`.
+- **11 page-level `metadata` exports are still hardcoded English titles.** The
+  root layout and login page use `generateMetadata`; the rest need the same
+  async conversion.
+- **`relativeTime` (`lib/workflow-status.ts`) and `formatCompactNumber`
+  (`lib/utils.ts`) still hardcode English.** `relativeTime` returns copy
+  (`"3m ago"`), so its 12 call sites migrate with the feature-page copy of the
+  files that render it rather than being touched twice. Note it must **not**
+  become `Intl.RelativeTimeFormat`, which yields `"1 hr. ago"` and would visibly
+  loosen the audit tape.
+- **The global 404 for paths that skip the proxy matcher** (e.g. `/foo.txt`)
+  renders Next's builtin error shell rather than app chrome. `experimental.globalNotFound`
+  with `app/global-not-found.tsx` was tried and is **not wired up** by Next
+  16.1.6 under Turbopack — the file never compiles — so it was removed rather
+  than left as dead code. Unreachable from in-app navigation.
+
+## How to add a language
+
+1. Add the BCP-47 **tag** to `LOCALES` in `lib/i18n/config.ts`.
+2. Add its **slug** to `LOCALE_SLUGS`, its own-language name to
+   `LOCALE_LABELS`, and its compact header label to `LOCALE_SHORT_LABELS`.
+3. Copy `messages/en.json` to `messages/<slug>.json` and translate it.
+4. If the slug differs from the tag, `LOCALE_PREFIXES` picks it up
+   automatically; add the slug to the `/knowledge` redirect alternation in
+   `next.config.ts` (the one place that must duplicate the list).
+
+`lib/i18n/config.test.ts` and `lib/i18n/messages.test.ts` fail until all of it
+is done. The switcher needs no change — it renders from the registry.
+
+## Tests
+
+Unit tests (vitest, node environment) under `apps/frontend/lib/i18n/`:
+
+- `config.test.ts` — registry invariants: default locale is a member, every
+  locale has a slug and label, slugs are unique/lowercase/URL-safe, no slug
+  collides with a `VERTICALS` slug or a static route segment, and **every tag
+  survives an `Intl` round-trip**.
+- `path.test.ts` — `splitLocaleSlug` across prefixed, unprefixed, bare-slug,
+  wrong-case and boundary (`/cnn`) inputs.
+- `messages.test.ts` — key parity between catalogs, no empty values, and
+  matching ICU **argument names** (compared as a set, since plural categories
+  legitimately differ — Chinese has no `one` form). Verified non-vacuous by
+  deliberately dropping a key, blanking a value and renaming an argument.
+- `lib/immersive/routes.test.ts` — the slug-stripped-pathname contract.
+
+```bash
+cd apps/frontend
+/Users/azat/Library/pnpm/pnpm test     # vitest — 123 passing
+npx --no-install tsc --noEmit          # enforces typed message keys
+npx --no-install biome check .
+/Users/azat/Library/pnpm/pnpm build
+```
+
+`biome check .` reports 1 pre-existing error (`app/icon.svg`,
+`noSvgWithoutTitle`) and 1 pre-existing warning, both in files this work did not
+touch. That was the baseline before these changes too — verified against a
+worktree at the prior commit.
+
+Verified end-to-end against dev and production servers:
+
+| Request | Result |
+| --- | --- |
+| `/` | 307 → `/en` |
+| `/atlas` | 307 → `/en/atlas` |
+| `/en/atlas` (signed out) | → `/en/login?redirect=/atlas` (bare param, no double prefix) |
+| `/cn/atlas` (signed out) | → `/cn/login?redirect=/atlas` (locale survives the gate) |
+| `Accept-Language: zh-CN` on `/` | → `/cn` |
+| `Accept-Language: de-DE` on `/` | → `/en` |
+| `/CN/atlas` | → `/cn/atlas` (next-intl normalises case) |
+| `/cnn/x` | → `/en/cnn/x` (slug boundary respected) |
+| `/cn/knowledge` | → `/cn/atlas` |
+| `/api/mother-ai/health` | 401 JSON — unprefixed, no redirect |
+| `/en/login` | `<html lang="en">`, `<title>Sign in · Amos</title>` |
+| `/cn/login` | `<html lang="zh-Hans">`, `<title>登录 · Amos</title>`, Chinese copy and aria-labels |
+
+The shell catalog costs ~1.4 KB gzipped in the flight payload. Note the whole
+active-locale catalog is serialized per document load; if that grows
+uncomfortable once feature copy lands, scope `NextIntlClientProvider` to the
+namespaces the client actually needs — call sites do not change.
+
+**Not verified locally:** rendered `<Link>` output on an authenticated page, and
+the Google / Meta OAuth round trips. The auth service is in-cluster, so every
+gated route redirects to login from a dev machine. These need one manual pass
+against a real session: confirm nav links carry the active slug, that switching
+language on a feature page stays put, and that both OAuth flows return to a
+same-locale URL.

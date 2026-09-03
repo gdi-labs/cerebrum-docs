@@ -54,18 +54,75 @@ records the corrected semantics so they don't regress.
 
 ## Pricing (related)
 
-Paid-model token pricing lives in `worker/worker/llm/providers.py`
-`_PRICING_PER_1K`. `claude-opus-4-7` and the bare `anthropic` fallback
-reflect our contracted rate (1/3.5 of Anthropic's published list); the
-explicit `claude-3-5-sonnet-latest` entry stays at list. `cost_usd` on
-`job_runs` is computed from this table; the UI formats the resulting
-number and never sees per-token figures.
+**Pricing moved out of the code (2026-09-02).** It lives in
+`config/model_catalog.yaml` as `pricing_per_1k` per model, and the catalog
+**refuses to load a paid chat model with no price** — precisely because the old
+`_PRICING_PER_1K` dict had no OpenAI or Gemini entry and the lookup defaulted
+to `(0.0, 0.0)`, so every one of those calls recorded $0.00 for months. A
+startup crash naming the model is better than a cost dashboard that quietly
+lies.
+
+`worker/worker/llm/providers.py::_PRICING_PER_1K` survives as the fallback for
+when the catalog is unreadable, and the Anthropic rows in both places carry our
+contracted rate (1/3.5 of the published list). `cost_usd` on `job_runs` is
+computed from whichever applies; the UI formats the number and never sees
+per-token figures.
+
+## Effort, reasoning and media (2026-09-02)
+
+`job_runs` gained two columns, added through the existing idempotent
+`alter table ... add column if not exists` pattern, so no migration step:
+
+| Column | Meaning |
+| --- | --- |
+| `effort` | The **strongest** normalized rung any level of the job asked for (`none`\|`low`\|`medium`\|`high`\|`max`). Empty for a job that asked for none — deliberately not `"none"`, which means a level explicitly asked the model *not* to think. |
+| `reasoning_tokens` | The **sum** across every call. |
+
+Those two answer different questions and both are needed: the strongest rung
+answers "how hard did this job think", the sum answers "what did that cost".
+Reporting only the last rung would hide a single expensive level; reporting only
+the total hides whether the spend was asked for or incidental. Folded by
+`_fold_reasoning` in `worker/worker/main.py`.
+
+Three more fields ride in the audit log rather than as columns, because they are
+per-call rather than per-job:
+
+- `media_refs` — modality, `media_id`, MIME, size and a content **hash** for
+  every attachment. Never the bytes: text redaction cannot touch a photograph,
+  so the trail records what was sent by reference and leaves the content in the
+  media store where lifecycle rules expire it. A part that was NOT sent (because
+  the model could not read it) is recorded with `sent: false` — the call
+  succeeded, so this is the only trace that the image never reached a model.
+- `audio_seconds` — from a transcription call, taken from the provider's own
+  `verbose_json` duration. Speech is billed and rate-limited by audio time, not
+  tokens, and a client-reported duration would be a claim rather than a
+  measurement.
+- `characters` — from a speech call. Every TTS vendor bills per character.
+
+## Provider labels
+
+`_normalize_provider` used to fold Anthropic into `"claude"` — a display name
+the backend never records — and mapped anything unrecognized to its bare
+lowercase name. Once routing opened to eight providers, the Model Mix tile
+started receiving `"deepseek"`, had no colour for it, and rendered the row with
+`undefined`. It now emits the backend's own keys (`anthropic`, `deepseek`,
+`zhipu`, `moonshot`, `minimax`, `groq`, `openrouter`, `gemini`, `openai`,
+`ollama`), the frontend covers the full set, and `providerColor()` falls back to
+grey so a provider added to the catalog appears immediately rather than
+invisibly.
 
 ## Impact scope
 
-All changes are read-side / cosmetic. No schema migration, no wire
-break. A worker restart picks up the new pricing on the next job; the
-telemetry API picks up the new tile queries on its next snapshot.
+All changes are read-side / cosmetic. The two new `job_runs` columns are added
+idempotently at startup, so there is no migration step and an older worker
+reading the table is unaffected. A worker restart picks up catalog pricing on
+the next job; the telemetry API picks up the new tile queries on its next
+snapshot.
+
+One behaviour change worth naming: rows written before this change have
+`provider = "claude"` if anything wrote that label, and the frontend no longer
+has a colour keyed on it — those rows render grey rather than pink. The worker
+itself always recorded `"anthropic"`, so this affects only the projection.
 
 ## Tests
 

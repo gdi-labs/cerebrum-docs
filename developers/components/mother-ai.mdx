@@ -23,10 +23,81 @@ description: The ingest service. Rust + Axum, stateless beyond Postgres-backed p
 | `GET` | `/v1/jobs/:id/stream` | SSE: replays Redis backlog, then streams the live pubsub channel until the job finishes or errors. |
 | `GET`/`POST` | `/v1/workflows` | Workflow graph CRUD. |
 | `GET`/`POST` | `/v1/projects` | Projects CRUD. |
-| `GET` | `/v1/models` | Available models — local Ollama plus configured Claude / OpenAI-compatible. |
+| `GET` | `/v1/models` | The model catalog — every provider, flavour, effort rung and cost tier, with live free-tier quota from Redis. |
 | `GET`/`POST` | `/v1/ollama/*` | Ollama health and wake. |
 | `POST` | `/v1/command/intents` | Non-LLM intent routing. |
 | `GET` | `/healthz` | Liveness. |
+
+## KB retrieval embeds elsewhere
+
+_(2026-09-03)_ `POST /v1/kb/query` — the endpoint behind the KB MCP tool, the
+capability acceptance check and the frontend's sources panel — no longer embeds
+its own query vector. It asks telemetry-api's `POST /v1/kb/embed` and then
+searches Qdrant as before (`routes::embed_via_telemetry`).
+
+It used to embed against Ollama on the GPU node, and would wait up to ten
+minutes for a wake. That is why the task modal showed "Waking GPU… ~2:36
+remaining" while someone read an answer about bloom filters: opening a job panel
+started a g5.xlarge to render a sidebar.
+
+mother-ai cannot embed against a hosted provider itself, for two reasons that
+are both about not spreading credentials:
+
+- The key is in Secrets Manager and reading it needs an AWS SDK this service
+  has no other use for. Injecting it as an env var was ruled out by a principle
+  already written into `terraform/modules/provider-secrets`: *a provider key in
+  state is a provider key in every plan output and every state backup.*
+- OpenAI geo-blocks ap-east-1, so the call needs the egress proxy that
+  telemetry-api already configures.
+
+The deeper reason is that there must be exactly **one** embedder: the indexer
+and every querier have to use the same model at the same width forever, and a
+second implementation in another language is a second place for that to drift
+into a different vector space — a failure that returns confident nonsense
+rather than an error.
+
+`EMBEDDING_PROVIDER=ollama` still takes the local path, so a rollback is one env
+var (plus a re-embed, since the vectors move with it).
+
+## Identifiers: `wf-N` and `pt-N` come from Postgres
+
+_(2026-09-03)_ Workflow and prompt ids are allocated by
+`mother-ai/src/ids.rs` from two Postgres sequences,
+`cerebrum_workflow_id_seq` and `cerebrum_prompt_id_seq`.
+
+They used to come from a Redis `INCR` on a key namespaced by `instance_id` —
+which `config::derive_instance_hash` derives from *the directory holding the
+control-plane config*. That made the numbering a function of the image layout,
+and it broke exactly that way: adding `COPY config /app/config` to the
+Dockerfile turned a failing `canonicalize()` into a succeeding one, the hash
+moved from `sha256("config")` to `sha256("/app/config")`, the counter restarted
+at 1, and a new workflow was handed `wf-9` — an id belonging to a workflow from
+five months earlier. Since `prompt_threads.workflow_id` is the only link
+between a workflow and its prompts, the new job and a stranger's April prompt
+rendered as one two-step workflow: the graph showed a level that never ran, and
+the detail panel showed an answer to a question nobody had just asked.
+
+The id namespace now lives where the rows it names live. A counter in the cache
+can only ever be a guess about what the durable store already contains — it
+restarts on a flush, an eviction, or a key rename, and nothing notices until two
+eras of data are stitched together in one view.
+
+Two properties worth knowing:
+
+- **Self-repairing.** On the first allocation in a process the sequence is
+  aligned past the highest id any of `prompt_threads`, `workflow_runs` and
+  `job_runs` has already issued, and alignment only ever moves forward. A
+  database restored from a dump, or a counter that already drifted, converges
+  without a migration.
+- **No fallback when Postgres is configured.** A sequence failure returns an
+  error rather than reaching for the Redis counter, because quietly reaching for
+  that counter is the failure being removed. Redis remains the allocator only
+  when no `POSTGRES_DSN` is set at all — a local checkout with nothing to
+  collide with.
+
+`instance_id` still namespaces the job queue key and the rate-limit counters.
+Those are pinned explicitly by Terraform (`JOB_QUEUE_KEY` on all three
+services), so a path change re-namespaces nothing that outlives a process.
 
 ## SSE invariant
 

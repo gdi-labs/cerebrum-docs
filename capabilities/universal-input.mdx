@@ -164,6 +164,23 @@ composer does not.
   composable follow-ups (classifier → real scenario → optional
   follow-on) have two more slots before the cap fires.
 
+### The Task input is now also a voice input (2026-08-21)
+
+Free text no longer has to be typed. The command widget's default surface is
+push-to-talk, and any utterance that doesn't match a local navigation command
+falls through to this exact path — `submitCommandIntent({kind: "task"})`, then
+`intent_classifier`. The classifier's low-confidence `disambiguate` level is
+what turns a vague spoken request into a two-way conversation: the question is
+read aloud, and the spoken answer is snapped to the nearest enum option before
+being handed to the existing `resume()`.
+
+Nothing in the classifier or the `ask_user` contract changed to allow this —
+voice is an input path onto the surfaces described above. The widget's own
+restructuring (it now portals out of the footer and has a hidden/expanded
+peek state) is covered in `Voice Control`, including why
+`components/layout/footer/command-widget.tsx` moved to
+`components/layout/command/`.
+
 ## Tests
 
 - `tests/test_scenario_chain.py` — chain hop, MAX_CHAIN_DEPTH cap,

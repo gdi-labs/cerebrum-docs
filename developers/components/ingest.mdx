@@ -8,18 +8,46 @@ description: The pipeline that pushes the knowledge hub into Qdrant. Runs locall
 
 - Reads every markdown file in the hub and parses YAML frontmatter against the hub schema.
 - Chunks each body by heading.
-- Embeds chunks via Ollama (default `nomic-embed-text`), OpenAI (`text-embedding-3-small`), or a deterministic local-hash fallback for CI.
+- Embeds chunks via OpenAI (`text-embedding-3-small` at 768 dimensions, the default since 2026-09-03), Ollama (`nomic-embed-text`), or a deterministic local-hash fallback for CI.
 - Upserts chunks into Qdrant with payload indices on `kh_id`, `scope`, `scope_prefixes`, `sensitivity`, `source_type`, `team`, and `tags`.
 - Maintains a Postgres manifest so unchanged files are skipped on subsequent runs.
 - Sweeps orphans — IDs in the manifest but no longer in the hub get deleted from both Qdrant and the manifest.
 
 ## Embedding providers
 
-- **Ollama** (default): runs against a local or remote Ollama instance.
-- **OpenAI**: hosted embedding API.
-- **Hash**: deterministic local fallback for CI smoke tests; never used in production.
+- **OpenAI** (default since 2026-09-03): `text-embedding-3-small` at
+  `dimensions=768`, requested server-side so the vector arrives unit-length —
+  required, because the collections are Cosine and a client-side slice would
+  need re-normalizing.
+- **Ollama**: `nomic-embed-text` on the GPU node. Still supported, and no
+  longer used: it made every KB query wait on a node that scales to zero.
+- **Hash**: deterministic local fallback for CI smoke tests; never used in
+  production.
 
-If the configured provider can't be reached, the run aborts. There is no silent fallback in production.
+If the configured provider can't be reached, the run aborts. There is no silent
+fallback in production.
+
+**One embedder, everywhere.** The indexer and every querier must use the same
+model at the same width, forever: two models means two vector spaces, and that
+failure does not raise — it returns confident nonsense from coordinates that
+mean nothing. So the width lives in `config/model_catalog.yaml`
+(`kind: embedding`, `dimensions: 768`), credential and proxy resolution lives in
+`worker/worker/llm/embeddings.py`, and callers that cannot reach a provider
+themselves ask telemetry-api's `POST /v1/kb/embed` rather than growing a second
+implementation. Changing the model or the width is a re-embed, not an edit.
+
+Two things the hosted path needs that the local one did not, both learned by
+having them missing: the credential is in Secrets Manager (`OPENAI_API_KEY` is
+present in the environment and **empty**, so a check that stopped there reported
+"not configured"), and OpenAI **geo-blocks ap-east-1** — every call leaves
+through the proxy named by the provider's `proxy_env`.
+
+**Batched.** `EmbeddingProvider.embed_many` sends up to
+`OPENAI_EMBED_BATCH_SIZE` (128) inputs per request, which is what makes a
+~30,000-chunk backfill a few hundred round trips instead of 30,000. Order is
+restored from each item's `index` rather than assumed: vectors are zipped onto
+chunks positionally, so a reordered response would attach every vector to the
+wrong document.
 
 ## CLI
 
@@ -41,7 +69,9 @@ python ingest/ingest_hub.py
 | `QDRANT_COLLECTION` | Collection name; default `amos_knowledge_hub`. |
 | `EMBEDDING_PROVIDER` | One of `ollama`, `openai`, `hash`. |
 | `OLLAMA_BASE_URL`, `OLLAMA_EMBED_MODEL` | Ollama provider config. |
-| `OPENAI_API_KEY`, `OPENAI_EMBED_MODEL` | OpenAI provider config. |
+| `OPENAI_API_KEY`, `OPENAI_EMBED_MODEL` | OpenAI provider config. The key falls back to Secrets Manager (`cerebrum/providers/openai`) when the env var is empty. |
+| `EMBED_DIMENSIONS` | Width to request and enforce. Must match the live collection (768); Qdrant will not resize one that exists. |
+| `LLM_HTTP_PROXY` | Egress proxy for the geo-blocked provider. |
 | `POSTGRES_DSN` | Manifest persistence (optional). |
 
 The manifest write is skipped under `--no-manifest` (first runs, debug, or when Postgres is unavailable) and under `--dry-run`.

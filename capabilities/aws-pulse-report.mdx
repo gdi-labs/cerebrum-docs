@@ -32,6 +32,9 @@ all twelve AWS calls and the Slack publish run through the new
   aws_audit, cloud_audit, aws_cost, aws_security]`.
 - Three new prompt builders in `worker/worker/graph/scenarios/prompts.py`:
   `aws_pulse_collect`, `aws_pulse_synthesize`, `aws_pulse_publish`.
+  `aws_pulse_publish` interpolates the real UTC date into the Block Kit
+  header instruction; when it was a `<today's date>` placeholder the model
+  invented one (a 2026-09-03 run published "AWS Pulse — May 25, 2026").
 - CLI smoke runner: `python -m worker.scripts.run_scenario aws_pulse_report`.
   Routes through the real `LlmProviders` + `EnvToolSecretProvider`;
   prints the final Markdown body and a compact JSON tail.
@@ -43,6 +46,21 @@ all twelve AWS calls and the Slack publish run through the new
 - Requires per-tenant `aws_default` and `slack_bot` secrets seeded via
   `python -m worker.scripts.seed_tool_secret` (see the
   [external-tools-platform doc](/developers/components/external-tools-platform#tenant-secrets) for shape).
+  In EKS the correct shapes are:
+  - `aws_default` → `ref_kind=default_chain`. The resolver returns `{}`,
+    which `build_boto3_session` treats as "use the boto3 default
+    credential chain" — i.e. the worker pod's IRSA identity
+    (`cerebrum-worker-irsa`, which carries `ReadOnlyAccess`). Do **not**
+    use `ref_kind=env`: the worker Deployment injects no credential env
+    var, so every `aws_*` tool fails with `ToolSecretError` and the run
+    still reports `COMPLETED` with an empty report.
+  - `slack_bot` → `ref_kind=secrets_manager` pointing at
+    `cerebrum/connectors/slack` (`{token: xoxb-…, default_channel: C…}`).
+    `default_channel` is mandatory — the publish prompt deliberately omits
+    `channel` so the tool fills it in. The bot must also be **invited to
+    that channel**: for a private channel a non-member bot gets
+    `channel_not_found` (not `not_in_channel`), which reads like a bad
+    channel id but is a membership problem.
 - Defaults to off — only fires on jobs that carry one of the declared
   intent routes.
 - Cost-bounded by the scenario budget (`max_cost_usd: 2.50`,

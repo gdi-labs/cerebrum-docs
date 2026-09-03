@@ -1,0 +1,147 @@
+---
+title: QA answer panel — sources and follow-ups
+description: 'The task output modal (components/layout/footer/task-output-modal.tsx)
+  is where a quick_qa answer is read: the answer on the left, its retrieved sources
+  on the right, and a follow-up box underneath.'
+---
+
+## What it enables
+
+**The sources list counts documents, not chunks.** Retrieval returns chunks, so
+a document that answers a question in three places returned three of them. Each
+became its own card — identical title, identical `scope · sourceType` subtitle
+— because the only thing distinguishing them was text the panel never showed.
+An answer citing three documents reported "SOURCES (6)" and looked broken.
+Chunks are now folded per document, ranked by their best chunk score, with a
+`×3` badge when several passages hit.
+
+**A row shows the passage that matched, with the question's words emphasised.**
+The first attempt showed each chunk's section heading instead — but most
+documents in this hub open with an H1 equal to their frontmatter `title`, so the
+"what matched" line was the row's own title restated. The matched *text* was in
+the retrieval payload all along and never rendered. Now a row carries a
+~180-character snippet windowed around the first query match, and a heading is
+only shown when it says something the title doesn't.
+
+**A follow-up can run on a different model than the answer above it** — the
+point of asking again is often "try that on something stronger". The modal used
+to send a hardcoded `preferred_model: "qwen3:14b"`, a local Ollama model that no
+longer exists in `config/model_catalog.yaml`, so every follow-up pinned a dead
+id and paid for the resolver's fallback hop. It now carries the same model and
+effort pickers as the chat composers, inside the input box at its bottom-right,
+and `preferred_provider` travels with the id.
+
+**The header names the model in product terms** — "· Claude Haiku 4.5" behind
+its provider mark, rather than the raw `claude-haiku-4-5-20251001`.
+
+## What's changed
+
+- `apps/frontend/lib/knowledge/group-citations.ts` (new) — `groupCitations()`
+  folds chunks per document; `queryTerms()` and `snippetSegments()` build the
+  highlighted snippet. Pure, and in `lib/` rather than beside the component
+  because the vitest environment is `node` — a component test is not possible
+  here, a helper test is.
+- `apps/frontend/lib/knowledge/group-citations.test.ts` (new) — 25 cases.
+- `apps/frontend/components/layout/footer/task-output-modal.tsx` — the
+  `CitationsPanel` rows, a `SnippetText` renderer, and the follow-up model /
+  effort pickers (`components/ui/icon-select.tsx`).
+
+### Highlight matching, and why it is the way it is
+
+Two anchors, each earning its keep:
+
+- **No leading `\b`** and "use" highlights the middle of "because".
+- **No trailing `\b`** and a prefix match truncates mid-word. This one shipped
+  briefly: to make a singular query match a plural in the text, a trailing `s`
+  was stripped from the term — so asking about "Amos" lit up "Amo" and left the
+  final letter plain, which reads as a rendering bug.
+
+So plurals are handled by making the suffix optional *in the pattern*
+(`model(?:es|s)?`) rather than by shortening the term, and both ends are
+anchored. A short stopword list covers the words people phrase questions with
+("in one sentence — what models does Amos use?") which would otherwise light up
+half the snippet.
+
+### A portaled menu inside a hand-rolled click-away
+
+Putting the pickers in this modal broke it: choosing any model closed the
+modal instantly. Read this before adding another portaled layer anywhere
+inside the command widget.
+
+A floating layer renders into `document.body`, not into the React parent that
+owns it. `command-widget.tsx` closes its open panel from a document `mousedown`
+listener guarded by `containerRef.current.contains(e.target)` — the standard
+click-away test — and a menu item is not a DOM descendant of that container.
+So pressing a model *was* a click-away, and `dismiss()` unmounted the modal on
+`mousedown`, before the selection even resolved.
+
+`lib/ui/floating-layer.ts` holds the two predicates that fix it:
+
+- `isInsideFloatingLayer(target)` — bail out of a click-away handler. A press
+  on a menu item is a press inside the UI that opened the menu, wherever the
+  DOM put it.
+- `hasOpenFloatingLayer()` — bail out of an Escape handler, so one press closes
+  one thing: the menu, then the panel behind it on the next press. Both this
+  modal and the widget had the same Escape flaw.
+
+Both key on `data-radix-popper-content-wrapper`, the attribute
+`@radix-ui/react-popper` puts on the wrapper it renders around every
+popper-based layer — verified against the installed `@radix-ui/react-menu`,
+which renders its content through `PopperPrimitive.Content` and carries
+`data-state` on it.
+
+The Escape predicate depends on listener order and says so in its doc comment:
+the layer mounts *after* the panel, so Radix's own keydown listener registers
+later and ours runs first, while the menu is still open. A handler running
+after Radix's would find the menu already gone.
+
+Note this only bites non-modal layers. `IconSelect` sets `modal={false}`
+deliberately (a toolbar control must not `aria-hide` the app or lock scroll),
+which leaves outside pointer events live. Radix *Select* is modal by default
+and suppresses them, which is why the app's other hand-rolled click-aways
+never hit this with their `Select`s.
+
+## Impact scope
+
+- Confined to the task output modal and one new `lib/` module. No API, schema,
+  env var or infrastructure change; `/api/kb/query` still requests `top_k=6` and
+  its payload is unchanged — `content` and `section_title` were already in it.
+- The visible source count drops (6 chunks → 3 documents). That is the fix, but
+  it does mean the number no longer matches `top_k`.
+- The skeleton still renders six placeholder rows while loading, so the panel
+  briefly reserves more rows than it will show. Harmless, and preferable to
+  reflowing upward.
+- Follow-up requests change shape: no `preferred_model` at all on Auto, and
+  `preferred_model` + `preferred_provider` together when pinned.
+
+## Tests
+
+```bash
+cd apps/frontend
+/Users/azat/Library/pnpm/pnpm test            # 307 pass
+npx --no-install vitest run lib/knowledge     # just this area
+npx --no-install tsc --noEmit
+/Users/azat/Library/pnpm/pnpm run lint
+```
+
+Covered: folding, best-score ordering and snippet selection, headings that
+restate the title, repeated headings across chunks of one section, missing
+`kh_id`, whole-word and plural matching, the "because"/"among" false positives,
+windowing around a deep match, a query of nothing but stopwords, regex
+characters in the query, and segment offsets indexing the rendered string.
+
+Pre-existing lint failures elsewhere, unrelated to this work: `app/icon.svg`
+(`a11y/noSvgWithoutTitle`) and `lib/voice/stt/server.ts` (formatter).
+
+Manual — the vitest environment is `node` with no jsdom, so none of the
+following is reachable from a test:
+
+1. Ask a `quick_qa` question. The source count equals the number of distinct
+   documents, and each row's snippet contains the question's words emphasised.
+2. **Open the model dropdown and pick something. The modal must stay open.**
+   This is the retarget bug above; nothing in the type-checker or the suite
+   catches it.
+3. Click the backdrop — the modal closes. Press inside the panel and release on
+   the backdrop — it does not.
+4. Pick a different model for a follow-up and send: the next answer's header
+   names that model.

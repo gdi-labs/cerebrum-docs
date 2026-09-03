@@ -33,6 +33,7 @@
               "capabilities/declarative-agent-flows",
               "capabilities/frontend-authentication",
               "capabilities/hide-workflow",
+              "capabilities/internationalization",
               "capabilities/project-console",
               "capabilities/requirements-clarification-gate",
               "capabilities/scenario-aware-job-panel",
@@ -70,6 +71,7 @@
               "developers/components/frontend",
               "developers/components/mcp-amos-kb",
               "developers/components/agent-workbench",
+              "developers/components/composer-model-picker",
               "developers/components/connectors",
               "developers/components/diaries",
               "developers/components/external-tools-platform",
@@ -77,6 +79,7 @@
               "developers/components/job-telemetry",
               "developers/components/l4-ask-user",
               "developers/components/notion-ingest",
+              "developers/components/qa-answer-panel",
               "developers/components/scenarios-runtime"
             ]
           }
