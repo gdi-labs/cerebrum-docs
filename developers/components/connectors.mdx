@@ -147,6 +147,8 @@ Each channel carries its own `scope`, `sensitivity` (`public | partner | interna
 
 A separate one-shot tool, `ingest/connectors/slack_backfill.py`, handles re-seeding a channel from a workspace export when bot access only landed recently. The daily-driver path is the connector above.
 
+**Not the only Slack path any more.** This connector is a scheduled *pull* into the hub, and it stays exactly that. Since 2026-09-05 Slack is also a live conversational surface — a DM or `@Amos` becomes a turn on a workflow, and the answer comes back in the thread. That is a separate mechanism with its own credential, endpoint and storage; see [Slack Conversation](/capabilities/slack-conversation). Its mrkdwn converter is the deliberate inverse of this connector's `transform_slack_text`, and the two are worth keeping in lockstep.
+
 ---
 
 ## GitHub connector

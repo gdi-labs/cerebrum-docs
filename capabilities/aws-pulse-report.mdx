@@ -61,6 +61,11 @@ all twelve AWS calls and the Slack publish run through the new
     that channel**: for a private channel a non-member bot gets
     `channel_not_found` (not `not_in_channel`), which reads like a bad
     channel id but is a membership problem.
+  - The same Slack app now also serves inbound conversation
+    ([Slack Conversation](/capabilities/slack-conversation)), which needs additional
+    scopes. Adding scopes requires **reinstalling** the app — which rotates
+    nothing here, but does mean a scope change for one feature briefly
+    touches the token this one reads.
 - Defaults to off — only fires on jobs that carry one of the declared
   intent routes.
 - Cost-bounded by the scenario budget (`max_cost_usd: 2.50`,

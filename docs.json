@@ -37,6 +37,7 @@
               "capabilities/project-console",
               "capabilities/requirements-clarification-gate",
               "capabilities/scenario-aware-job-panel",
+              "capabilities/slack-conversation",
               "capabilities/solutions-catalog",
               "capabilities/universal-input",
               "capabilities/user-feedback-system"

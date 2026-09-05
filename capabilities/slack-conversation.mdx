@@ -1,0 +1,193 @@
+---
+title: Slack Conversation
+description: '## What it enables'
+---
+
+Slack is now a **front end onto Amos**, not a notification sink.
+
+- **Talk to the bot and get an answer.** DM the Amos app, or `@Amos` in any
+  channel it is invited to, and the reply comes back in the thread — routed
+  through the same `intent_classifier` scenario the website's "Ask anything"
+  uses, so the answer is the answer, not a Slack-specific subset.
+- **Threads are conversations.** A Slack thread maps to one workflow, so a
+  follow-up reply continues with prior turns in context. The same conversation
+  is visible on the website, owned by the same person.
+- **Mid-run questions get answered where they were asked.** When a scenario
+  parks on a human gate, Amos asks in the thread — buttons where one click can
+  express the answer, a numbered list where it cannot — and either a click or a
+  typed reply resumes the job.
+- **Approval buttons work.** They previously did nothing at all, for four
+  independent reasons (see *What's changed*).
+
+Before this, both Slack integrations were one-way: the AWS Pulse report posted
+out, and the approval bot posted out. Nothing came back.
+
+## What's changed
+
+### The buttons were dead — four causes
+
+1. **`SLACK_SIGNING_SECRET` was empty in the cluster.**
+   `verify_slack_signature` (`mother-ai/src/routes.rs`) rejects *every* request
+   when the secret is unset, which is the correct stance for an endpoint whose
+   only authentication is the signature — so `POST /v1/slack/interactions`, which
+   was otherwise fully implemented, 401'd on every click.
+2. **Slack ignores the interactivity response body for Block Kit
+   `block_actions`.** Returning `{"text": …}` is the legacy `interactive_message`
+   mechanism. The approval *was* being decided; the DM just never changed, which
+   reads as a dead button. Now replaced through `payload.response_url`
+   (`post_slack_response_url`), host-guarded and best-effort.
+3. **`close_slack_message` had zero call sites** since it was written, so a gate
+   decided in the web inbox left live-looking buttons in Slack forever. Wired
+   into the gate's resume edge (`_close_approver_dm` in
+   `worker/worker/graph/scenarios/runners.py`) — the one path every decision
+   crosses, whichever surface made it.
+4. **`_notify` in the acquisition runner called `notify_approval(approval=…)`,
+   which is not a parameter.** Every human-task DM raised `TypeError` into a
+   `LOGGER.debug`, so that class of approval never reached Slack. A
+   signature-bind test now pins the shape both call sites share.
+
+Also: `CEREBRUM_APP_BASE_URL` was read in two places and set nowhere, so the
+capability-live and vertical-ready DMs rendered without their buttons.
+
+### Inbound conversation
+
+| Surface | Where |
+| --- | --- |
+| `POST /v1/slack/events` | `mother-ai/src/routes.rs` — `slack_events`, `triage_slack_event` |
+| `POST /v1/slack/interactions` | same file — now dispatches an enum: approval buttons *and* `ask_option:` question buttons |
+| Reply delivery | `worker/worker/orchestration/slack_reply.py` |
+| Markdown → mrkdwn | `worker/worker/runtime/tools/builtins/slack/mrkdwn.py` |
+| Completion hooks | `worker/worker/main.py` — `_maybe_slack_reply`, `_slack_reply_for_prompt`, `_make_slack_ask_sink` |
+| Thread + identity storage | `worker/worker/storage/postgres_repo.py` — `slack_threads`, `get_user_by_slack_id` |
+
+New tables and columns:
+
+- **`slack_threads`** — `primary key (channel, thread_ts)` → `workflow_id`,
+  `user_id`, `team_id`, `last_job_id`. A table rather than an index on
+  `workflow_runs.metadata` because the claim must be *atomic* (two messages in
+  one thread would otherwise each create a workflow and split the history) and
+  because `upsert_workflow_prompt_in_postgres` rewrites that metadata on every
+  append.
+- **`idx_user_slack_identities_slack_user`** — a partial, deliberately
+  **non-unique** index for the reverse lookup. The column is nullable,
+  `clear_slack_user_id` nulls it and the upsert keys on `user_id`, so duplicates
+  are already possible; a unique index would fail on existing data inside
+  `ensure_schema()`, whose failure mode is "no worker boots at all".
+
+New environment / Terraform:
+
+- `SLACK_BOT_TOKEN` and `SLACK_TEAM_ID` on mother-ai (`slack_bot_token`,
+  `slack_team_id` through the three Terraform layers).
+- `CEREBRUM_APP_BASE_URL` on the worker (`app_base_url`).
+
+### Identity
+
+A Slack author becomes an Amos user by **workspace-verified email match**:
+`users.info` → `profile.email` → `"user"` where `banned is not true`. It only
+ever *matches* an existing account, never creates one, and the author's team
+(`event.user_team`, not the envelope's `team_id` — those differ in a Slack
+Connect channel) must be the configured workspace.
+
+This is a deliberate exception to `approval_notify`'s "a user fact comes from
+the user" rule, and it is recorded in that module's docstring. A row written
+`source='slack_profile'` was never asked for, and `resolve_recipient` does not
+filter on `source` — so such a user also becomes reachable for outbound
+approval DMs.
+
+### The resume-shape contract
+
+There are four resume value shapes (mirroring the frontend's
+`pickAskUserRenderer`) and sending the wrong one **fails silently**: a gate with
+no `x-feedback` descriptor reads `value["approved"]`, so answering it with
+`{"selected": [], "text": "yes go ahead"}` evaluates to `False`, rejects what
+the human just approved, and registers an escalation failure.
+
+Only the worker holds the schema, so the worker decides the shape and writes it
+into `cerebrum:slack:await:{channel}:{thread_ts}` as
+`{job_id, interrupt_id, shape, options}`. mother-ai fills the envelope from
+that rather than re-deriving it.
+
+## Impact scope
+
+**Backwards-compatible.** Nothing changes for a job that did not arrive from
+Slack: `resolve_reply_channel` returns `None` and no Slack code runs.
+
+**Off by default.** Inbound conversation needs `slack_signing_secret`,
+`slack_bot_token` and `slack_team_id` set. Any one unset means inbound refuses
+rather than degrades — an unset workspace id in particular refuses every message
+rather than trusting one from anywhere.
+
+**Changed for everyone (not just Slack):**
+
+- Approval DMs now visibly close when decided, from either surface.
+- `human_action` approval DMs send at all for the first time.
+- The four pre-graph gates coerce an invalid resume value instead of raising,
+  and `_handle_resume_envelope`'s dispatch is wrapped. Previously one malformed
+  resume value propagated out of the main `while True` and **exited the worker
+  process**; it now fails one job and leaves a terminal status behind.
+- `resume_parked_job` takes an `interrupt_id`. The existing approval caller
+  passes `None` (unchanged behaviour — an approval row *is* its gate).
+
+**Deliberate limits:**
+
+- **No per-user budget enforcement on the Slack path.** mother-ai has one static
+  api key; the 402 lives in the Next BFF. Ownership *is* enforced, because that
+  is a data-leak boundary rather than a spend one.
+- One turn at a time per thread. A second message while the first runs is
+  answered with "still working on your previous message" — prompts default to
+  `parallelizable`, and `sequential_only` is worse (the deferral path re-enqueues
+  with no backoff and fails the job past 25 deferrals).
+- No slash command, no attachments (`file_share` gets a spoken refusal, not
+  silence), no multi-select checkboxes, no live progress — an ack, then the
+  answer.
+- Thread history is the worker's usual window: the last 6 completed turns,
+  truncated. A long Slack thread will feel slightly thinner than the transcript
+  looks. Amos also never reads Slack thread history directly.
+
+## Tests
+
+```bash
+/Users/azat/labs/cerebrum/worker/.venv/bin/python -m pytest tests/ -v
+cd mother-ai && cargo test
+```
+
+- **`tests/test_slack_reply.py`** (52) — mrkdwn conversion (escaping, fences,
+  the bold-before-italic ordering trap), chunking (never inside a fence, an
+  unbreakable line hard-cut rather than dropped), reply delivery and thread
+  release, the four resume shapes, question rendering and Slack's limits, the
+  `ask_user` bus sink, pre-graph coercion.
+- **`tests/test_approvals.py`** (47) — adds the `notify_approval` signature-bind
+  regression and the DM-close path.
+- **`tests/test_slack_threads_postgres.py`** (13) — live Postgres. Includes an
+  8-way concurrent `claim_slack_thread` proving exactly one winner, the
+  duplicate-`slack_user_id` tie-break, and an `EXPLAIN` check that the partial
+  index covers the lookup. Skipped unless `TEST_POSTGRES_DSN` is set; see the
+  module docstring for the throwaway-server recipe.
+- **`mother-ai` `cargo test`** (89) — every triage trapdoor (DM/mention double
+  delivery, `bot_id` self-loop, `message_changed` re-running a turn,
+  `file_share` named rather than dropped, author team vs envelope team,
+  empty-after-stripping, `event_id` read off the outer envelope), the
+  `SlackAction` enum, the resume-value mapping per shape, and the
+  `response_url` host guard.
+- **`tests/conftest.py`** — a rail that fails any test reaching real Slack.
+  Guarded at `httpx.HTTPTransport`, the only boundary that is exactly the
+  network, so `mock_http_client`'s `MockTransport` passes through. Needed
+  because a real bot token resolves from Secrets Manager on a dev machine —
+  writing these tests posted to the live workspace once.
+
+**Pre-existing failures, not this change:** 9 in `test_taxonomy_store.py`,
+`test_vertical_offer_gate.py` and `test_open_world_boot.py`. Verified identical
+with this work stashed.
+
+## Setup checklist (manual, in the Slack app console)
+
+1. **Event Subscriptions** → Request URL `https://<ingress_host>/v1/slack/events`;
+   subscribe to `app_mention` and `message.im`.
+2. **Interactivity** → Request URL `https://<ingress_host>/v1/slack/interactions`.
+3. **Scopes:** `app_mentions:read`, `chat:write`, `im:history`, `im:write`,
+   `users:read`, `users:read.email`.
+4. **App Home** → enable the Messages Tab *and* "Allow users to send messages",
+   or the DM composer stays disabled and no `message.im` event can ever fire.
+5. **Reinstall the app** — scope changes require it.
+6. Set `slack_signing_secret`, `slack_bot_token` and `slack_team_id` in
+   `terraform.tfvars`, apply, and roll mother-ai.
