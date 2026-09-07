@@ -15,6 +15,77 @@ description: The orchestrator. A Python LangGraph service that consumes the job 
 - Persists status, cost, and audit trail.
 - Provisions per-project workspaces (clone, scaffold, trigger Vercel deploy).
 
+## Retrieval collections
+
+The worker reads three Qdrant collections and owns two of them.
+
+**What this enables.** User-authored rules and facts are retrievable at all, and a
+retrieval that fails is now distinguishable from one that found nothing. Previously
+`cerebrum_user_rules` and `cerebrum_facts` came into existence only as a side effect of the
+first successful rule/fact write; until that landed, every query returned a 404 that the
+read path logged as a warning and converted into an empty list. The context node reported
+success either way.
+
+**Who provisions what.**
+
+| Collection | Provisioned by | Notes |
+| --- | --- | --- |
+| `cerebrum_knowledge_hub` | the hub ingest CronJob (`ingest/ingest_hub.py`) | owns its width *and* its payload indices; the worker checks it exists and never creates it |
+| `cerebrum_user_rules` | worker startup preflight | no payload indices — neither call site filters |
+| `cerebrum_facts` | worker startup preflight | as above |
+
+The preflight is `ensure_runtime_collections()` in `worker/worker/rag/kb_writer.py`, called
+from `worker/worker/main.py` at boot. It is idempotent, non-fatal, and self-healing: a
+worker that cannot reach Qdrant still boots, and a rebuilt Qdrant is re-provisioned on the
+next rollout.
+
+**The width is configuration, not whichever vector arrives first.** Qdrant cannot resize a
+collection, so the width it is born with is permanent. Collections are created at
+`EmbeddingProvider.vector_size` — `EMBED_DIMENSIONS`, else the model catalog — rather than
+`len(vector)`. A stored width that disagrees with the configured one is logged as an ERROR
+and left alone; recreating it is data loss and an operator's call. `EMBEDDING_PROVIDER=hash`
+is a CI-only mode whose vectors are 384-d, so the preflight refuses to provision against a
+non-local Qdrant.
+
+**Failures are visible but never fatal.** `_retrieve_from_collection` classifies a missing
+collection separately from a query failure, logs both at ERROR, and still degrades to an
+empty result rather than killing the job. `AugmentedPromptPayload` carries
+`retrieval_degraded` and `retrieval_failures` (`"<collection>:<reason>"`, where reason is
+`missing`, `embed_failed`, `client_unavailable` or `error`), and `context_node` emits
+`node_finished{ok: false, retrieval_failures: [...]}` so the timeline marks the node. **Zero
+results are not degradation** — an empty rules collection is the normal steady state, and
+conflating the two is what hid this for months.
+
+**Client version.** `qdrant-client` is pinned `>=1.16.0,<1.19.0`: Qdrant requires a matching
+major and a minor within 1 of the server, which is the `qdrant/qdrant` chart pinned in
+`terraform/modules/qdrant`. Move the pin only together with the chart. Only
+`worker/requirements.txt` reaches the cluster — `ingest/` has no Dockerfile, so the
+`cerebrum-hub-ingest` CronJob runs the worker image. The engine also caches one client
+instead of building one per query, which removes three version-handshake round trips per job.
+
+See [Ingest](/developers/components/ingest) for the embedding provider itself — there is one embedder for the
+whole system, and this component does not get its own.
+
+**Impact scope.** Backwards compatible and no re-embed: `cerebrum_knowledge_hub` is
+untouched, both new payload fields default to off, and the preflight only ever adds
+collections. The client pin changes nothing locally (the venv already resolved inside the
+window) — it only takes effect on the next worker image build.
+
+**Tests.** Unit coverage in `tests/test_qdrant_provisioning.py` (provisioning, idempotency,
+width mismatch, the hash guard, unreachable Qdrant, a typo'd provider),
+`tests/test_context_engine.py` (404 classification including a message-only variant, client
+caching, and the "empty is not degraded" case), `tests/test_context_node_health.py` (the
+emitted `ok`), and `tests/test_embedding_providers.py` (`vector_size` per provider, and that
+a new collection is sized from config rather than from the vector). Run from the repo root:
+
+```bash
+worker/.venv/bin/python -m pytest tests/ -q
+```
+
+There is a standing baseline of 9 unrelated failures (taxonomy / vertical / open-world) and
+4 unrelated `knowledge-hub/packs/*/capabilities.md` frontmatter-lint failures; stash and
+re-run to confirm a failure is not pre-existing.
+
 ## Model dispatch
 
 Free and paid model dispatch with health-ranked provider fallback.

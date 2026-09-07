@@ -19,7 +19,7 @@ The base owns the rest:
 
 - **Deterministic identity** — `kh-id` is `kh-<26-char Crockford32>` derived from a stable `source_id` (SHA-256, first 16 bytes encoded). Same upstream record always yields the same id, so updates rewrite the same chunk rather than spawning duplicates.
 - **Idempotent writes** — when an existing file's canonical frontmatter + body match the new render, the write is skipped entirely. Existing `id` and `created_at` are preserved across rewrites.
-- **Cursor persistence** — the Postgres `connector_state` table (one row per connector) stores a JSON cursor so the next run picks up where this one left off.
+- **Cursor persistence** — the Postgres `connector_state` table (one row per connector) stores a JSON cursor so the next run picks up where this one left off. The cursor is **rolled back if the reindex fails**: `run_connector.main()` snapshots it before the run and restores it when `reindex_paths` raises. Without that, a failed reindex left the cursor reading "processed through here" while the records were never in Qdrant — and because the hub mount is ephemeral, the rendered files were gone too. Those records would never be fetched again: silently absent from retrieval, with no error after the failing run.
 - **Schema-compliant frontmatter** — every emitted document validates against `knowledge-hub/.kb/schema/frontmatter.schema.json` (required fields, sensitivity enum, `source_hash` format).
 
 ## Trigger model
@@ -93,6 +93,55 @@ Rich-text annotations stack `code → bold → italic → strikethrough → unde
 
 1. `conversations.history` with `oldest=<cursor>`, paginated via `next_cursor`. Returns messages descending by `ts`; the connector sorts ascending before yielding.
 2. For each message where `ts == thread_ts` AND `reply_count > 0`: `conversations.replies` to fetch the thread tail. Replies already in history are deduplicated by `ts`.
+
+**Channel access — the bot must be invited**
+
+`conversations.history` returns `not_in_channel` unless the bot is a member, even
+for public channels. The token carries `channels:history` and `channels:read` but
+**not** `channels:join`, so the app cannot add itself — someone has to run
+`/invite @<bot>` in each channel, or `channels:join` has to be added to the Slack
+app and the app reinstalled.
+
+A channel the bot cannot read is **skipped, not fatal**. `SlackApiError` carries
+Slack's machine-readable `error`, and `not_in_channel` / `channel_not_found` /
+`is_archived` are logged with the remedy and skipped, leaving that channel's
+cursor untouched so nothing is marked read that wasn't. Any other Slack error
+still fails the run.
+
+**A run that reads zero channels fails.** Degrading per-channel is correct;
+degrading to nothing is not. This is not hypothetical: the bot was removed from
+all three configured channels, every run aborted on the first one, and because
+the only symptom was a failing CronJob nobody was watching, Slack ingestion was
+dead for weeks while the index kept serving a static export.
+
+**File attachments — canvases carry the meeting notes**
+
+Slack huddle notes are posted by Slackbot as **canvases** (`filetype: quip`,
+`application/vnd.slack-docs`) with the message text empty. Rendering only the
+filename meant the most substantive content in a channel — actual meeting
+discussion — was invisible to retrieval: `#all-gdi-labs` had 44 such canvases
+(~208 KB, May–Sep 2026) indexed as nothing but a slugified link.
+
+Text-bearing attachments now have their bodies fetched and embedded. Governed by
+`TEXT_FILETYPES` / `TEXT_MIMETYPES` (canvas, post, text, markdown, `text/*`);
+images, PDFs, video and archives stay links, because there is no extractor for
+them and a binary blob in a day-file degrades retrieval rather than helping it.
+Capped at `MAX_FILE_BYTES` (256 KB) per file so one attachment can't dominate a
+day-file.
+
+- **Needs the `files:read` scope.** Without it every fetch returns 403 and each
+  file degrades to today's link-only rendering — the feature is inert, not
+  broken. `SLACK_INGEST_FILE_CONTENTS=0` disables it outright.
+- **Sensitivity is inherited from the channel**, exactly like the surrounding
+  messages. A file is not treated as more public than the conversation it was
+  posted in.
+- The label prefers the file's `title` over its `name`: huddle notes arrive as
+  `_headphones__Huddle_notes__8_31_26_in___C0B33NXGBSA_`, so the slug was what
+  got indexed and a search for "huddle notes August" matched nothing.
+- Canvas serialization is not a documented Slack format, so the converter is
+  deliberately conservative: strip tags when the body looks like HTML, otherwise
+  pass through. The fetch logs the real content type so this can be sharpened
+  from a live run.
 
 **Day bucketing**
 

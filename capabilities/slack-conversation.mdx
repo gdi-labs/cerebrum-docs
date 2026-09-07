@@ -74,11 +74,38 @@ New tables and columns:
   are already possible; a unique index would fail on existing data inside
   `ensure_schema()`, whose failure mode is "no worker boots at all".
 
-New environment / Terraform:
+### Credentials — one home, one thing to rotate
 
-- `SLACK_BOT_TOKEN` and `SLACK_TEAM_ID` on mother-ai (`slack_bot_token`,
-  `slack_team_id` through the three Terraform layers).
-- `CEREBRUM_APP_BASE_URL` on the worker (`app_base_url`).
+Everything the Slack app needs lives in **Secrets Manager at
+`cerebrum/connectors/slack`**, which is the same secret the worker already reads
+for approval DMs and the `slack_post_*` tools:
+
+```json
+{ "token": "xoxb-…", "signing_secret": "…", "default_channel": "C…" }
+```
+
+Terraform reads it (`data.aws_secretsmanager_secret_version.slack`) and projects
+`token` + `signing_secret` into `mother-ai-secrets`. The `slack_bot_token` /
+`slack_signing_secret` tfvars variables survive only as a fallback for an
+environment without Secrets Manager — copying the token into tfvars would
+otherwise create a second source of truth that silently drifts on rotation.
+
+Two values are **derived, not configured**. `slack_workspace()` in
+`mother-ai/src/routes.rs` calls `auth.test` once per process (lazily, cached in
+a `tokio::sync::OnceCell` so a transient outage at first contact costs one
+message rather than every message until a rollout) and gets back:
+
+- the **workspace id**, which is a property of the credential. Configuring it
+  separately only creates something that can drift, and it fails closed *and*
+  silently when it does — every message refused as "outside the allowed
+  workspace". `SLACK_TEAM_ID` remains an override.
+- the **bot's own user id**, which nothing else can supply and which is the
+  second half of the self-loop guard (`bot_id` is the first).
+
+The **signing secret is the only credential nothing can derive** — it exists
+only in the Slack app console. Everything inbound 401s until it is set.
+
+Also new: `CEREBRUM_APP_BASE_URL` on the worker (`app_base_url`).
 
 ### Identity
 
@@ -104,22 +131,42 @@ the human just approved, and registers an escalation failure.
 
 Only the worker holds the schema, so the worker decides the shape and writes it
 into `cerebrum:slack:await:{channel}:{thread_ts}` as
-`{job_id, interrupt_id, shape, options}`. mother-ai fills the envelope from
-that rather than re-deriving it.
+`{job_id, interrupt_id, shape, options, approval_id?}`. mother-ai fills the
+envelope from that rather than re-deriving it.
+
+`approval_id` is present when the gate also wrote an `approvals` row — which is
+exactly the case where two surfaces can see the same question. Then the resume
+goes through that row's atomic `where status = 'pending'` claim instead of a
+bare resume, so the web inbox and the Slack thread racing to answer produce one
+winner rather than two resumes of the same job.
 
 ## Impact scope
 
 **Backwards-compatible.** Nothing changes for a job that did not arrive from
 Slack: `resolve_reply_channel` returns `None` and no Slack code runs.
 
-**Off by default.** Inbound conversation needs `slack_signing_secret`,
-`slack_bot_token` and `slack_team_id` set. Any one unset means inbound refuses
-rather than degrades — an unset workspace id in particular refuses every message
-rather than trusting one from anywhere.
+**Off by default.** Inbound conversation needs `signing_secret` in the Slack
+secret. Unset means inbound *refuses* rather than degrades: the signature is the
+only authentication those endpoints have, so trusting an unsigned request would
+be worse than answering nothing.
 
 **Changed for everyone (not just Slack):**
 
-- Approval DMs now visibly close when decided, from either surface.
+- Approval DMs now visibly close when decided, from either surface — and say
+  *what* was decided. They used to render the internal option id and a raw
+  Better Auth user id (`Decided (quick_qa) by vOFhHe2f…`), which is unreadable
+  and prompted a human to reply in the thread asking what it meant. The option
+  label and the requester are both on the row; `decided_outcome` /
+  `decided_attribution` use them.
+- A DM'd approval can be answered **by typing in its thread**, not only by
+  clicking. `notify_approval` parks the thread on the gate, carrying the
+  `approval_id` so the resume goes through that row's atomic
+  `where status = 'pending'` claim — the bare resume path cannot make two
+  surfaces racing on one gate produce a single winner.
+- `approvals.workflow_id` is populated. It read `metadata["workflow_id"]`,
+  which nothing sets (the id travels on the job envelope and reaches the runner
+  via the bus), so **every row ever written had NULL** and no approval could be
+  joined to the workflow whose gate it was.
 - `human_action` approval DMs send at all for the first time.
 - The four pre-graph gates coerce an invalid resume value instead of raising,
   and `_handle_resume_envelope`'s dispatch is wrapped. Previously one malformed
@@ -163,7 +210,7 @@ cd mother-ai && cargo test
   duplicate-`slack_user_id` tie-break, and an `EXPLAIN` check that the partial
   index covers the lookup. Skipped unless `TEST_POSTGRES_DSN` is set; see the
   module docstring for the throwaway-server recipe.
-- **`mother-ai` `cargo test`** (89) — every triage trapdoor (DM/mention double
+- **`mother-ai` `cargo test`** (90) — every triage trapdoor (DM/mention double
   delivery, `bot_id` self-loop, `message_changed` re-running a turn,
   `file_share` named rather than dropped, author team vs envelope team,
   empty-after-stripping, `event_id` read off the outer envelope), the
@@ -179,15 +226,52 @@ cd mother-ai && cargo test
 `test_vertical_offer_gate.py` and `test_open_world_boot.py`. Verified identical
 with this work stashed.
 
-## Setup checklist (manual, in the Slack app console)
+## Setup checklist
 
-1. **Event Subscriptions** → Request URL `https://<ingress_host>/v1/slack/events`;
-   subscribe to `app_mention` and `message.im`.
-2. **Interactivity** → Request URL `https://<ingress_host>/v1/slack/interactions`.
-3. **Scopes:** `app_mentions:read`, `chat:write`, `im:history`, `im:write`,
-   `users:read`, `users:read.email`.
-4. **App Home** → enable the Messages Tab *and* "Allow users to send messages",
+Everything here is manual because none of it can be derived: a signing secret
+and a scope grant exist only in the Slack app console.
+
+1. **Store the signing secret** (Slack app → Basic Information) next to the
+   token, so there is still one credential home:
+
+   ```bash
+   aws secretsmanager get-secret-value --region ap-east-1 \
+     --secret-id cerebrum/connectors/slack --query SecretString --output text \
+     | jq '. + {signing_secret: "PASTE"}' \
+     | xargs -0 aws secretsmanager put-secret-value --region ap-east-1 \
+         --secret-id cerebrum/connectors/slack --secret-string
+   ```
+
+2. **Scopes:** `app_mentions:read`, `chat:write`, `im:history`, `im:write`,
+   `users:read`, `users:read.email`. Verify what is actually granted rather
+   than what the console page appears to show — the header is authoritative:
+
+   ```bash
+   curl -sD - -o /dev/null -H "Authorization: Bearer $TOKEN" \
+     https://slack.com/api/auth.test | grep -i x-oauth-scopes
+   ```
+
+   `users:read.email` is only needed for a user with no
+   `user_slack_identities` row yet; an existing mapping resolves from the DB.
+3. **App Home** → enable the Messages Tab *and* "Allow users to send messages",
    or the DM composer stays disabled and no `message.im` event can ever fire.
-5. **Reinstall the app** — scope changes require it.
-6. Set `slack_signing_secret`, `slack_bot_token` and `slack_team_id` in
-   `terraform.tfvars`, apply, and roll mother-ai.
+4. **Event Subscriptions** → Request URL `https://<ingress_host>/v1/slack/events`;
+   subscribe to `app_mention` and `message.im`. The URL only verifies *after*
+   the signing secret is live.
+5. **Interactivity** → Request URL `https://<ingress_host>/v1/slack/interactions`.
+6. **Reinstall the app** — scope changes require it.
+7. `terraform apply` (picks the credentials out of Secrets Manager) and rebuild
+   the worker + mother-ai images.
+
+### Diagnosing silence
+
+mother-ai sets no `RUST_LOG`, so its `TraceLayer` logs nothing and an inbound
+request leaves no trace at all. Before testing:
+
+```bash
+kubectl set env -n cerebrum deploy/mother-ai RUST_LOG=mother_ai=debug,info
+```
+
+The triage ignore-reasons are `debug`-level and name the exact rule that dropped
+a message (`author is outside the allowed workspace`, `app_mention duplicating a
+DM`, `message subtype`…). Reverted by the next `terraform apply`.
