@@ -274,6 +274,72 @@ edges. For conditional edges:
   otherwise the stale state of skipped levels would route a retry edge
   back into a loop (e.g. `l3_build_verify → l4_execute` forever).
 
+## 5b. What a node returns is what survives (2026-09-07)
+
+LangGraph persists a state channel **only when a node returns it in its delta**.
+A channel that a node mutates in place and forgets to return keeps whatever was
+last *written* — and that is invisible until the graph is re-hydrated from the
+checkpoint, which happens on every resume after an `ask_user` interrupt, every
+worker restart, and every re-enqueue. Inside one continuous execution the
+channel hands back the same Python object, so the mutation appears to stick.
+
+Two bugs came from this, both found on build wf-554.
+
+**The escalation budget reset.** `EscalationTracker.register_failure` mutates the
+tracker, and all three call sites in `graph/scenarios/runners.py` dropped it. So
+every re-hydration reset the attempt counts to zero and retry budgets restarted
+mid-run. wf-554 took **5 `l3_build_verify` laps against `max_attempts_per_conflict`
+= 3** — it interrupted for user input at 12:25 and resumed at 12:31, which is
+where the count reset. Each lap is a full `l4_execute` tool loop, so this is
+expensive rather than merely untidy. It did eventually escalate, so this is a
+budget that restarts, not one that never fires.
+
+The tell, straight from `checkpoint_blobs` for that thread:
+
+| channel | versions written |
+| --- | --- |
+| `levels` (returned in its delta) | 21 |
+| `scratchpad` (returned in its delta) | 6 |
+| `tracker` (mutated, dropped) | **1** — init only, 103 bytes |
+
+The level's own `attempts` counter incremented correctly the whole time because
+it rides in `delta["levels"]`: two counters for the same retry, one persisted.
+`_register_failure` now returns `(escalate, tracker)` so a caller cannot forget,
+and all three sites assign `delta["tracker"]`.
+
+**The audit bloat.** `ModelCallResult.to_audit_dict()` carries `input_text` (the
+whole prompt), `raw_response` (the whole provider response), `output_blocks` and
+`tool_calls`, and these were appended to `state["model_calls"]` — a checkpointed
+channel. The whole growing list was therefore re-serialized every superstep:
+**quadratic in call count**, with a build prompt as the constant. wf-554 wrote
+**289 MB across 13 versions** of that channel (largest single write 49 MB) plus
+49 MB on `audit_log`; that one run was 338 MB of a 418 MB database. Postgres here
+runs `shared_buffers` = 128 MB on a 1 CPU / 1 GB pod, so a single write evicted a
+third of the buffer cache and pushed out the small hot tables the dashboard
+reads — the mechanism behind "the UI is very slow". Even a healthy 42-call build
+wrote a 7.8 MB audit and 22 MB of checkpoints.
+
+Nothing in the graph reads those fields mid-run; every consumer is post-run
+(`job_runs.audit_log`, which mother-ai and the frontend read for raw responses
+and prompts, plus the replay harness). So `graph/scenarios/audit_sink.py` now
+takes the full entry — one row per call in `model_call_audit`, keyed by
+`prompt_id` — while graph state keeps a metadata-only entry, and the orchestrator
+reassembles the full list from the sink when it builds the `ScenarioResult`.
+Downstream shape is unchanged.
+
+`record_audit_entry()` is the single place that split is decided, because there
+are three record sites (prompt level, its verdict-repair follow-up, and each turn
+of the tool loop) and the easy bug is adding a fourth that forgets. The tool loop
+is the one that dominated: once per turn, up to `max_iterations`.
+
+The sink is reached through a ContextVar rather than a state field for the same
+reason the event bus is — declaring it on `ScenarioState` would make it a
+checkpointed channel.
+
+**The rule for new state:** if a node changes a mutable channel, return it. If a
+channel is a handle rather than data (a bus, a sink, a client), keep it off
+`ScenarioState` and reach it through a ContextVar.
+
 ## 6. Termination
 
 When the graph reaches `END`, the orchestrator:
