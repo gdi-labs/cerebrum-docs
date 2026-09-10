@@ -109,8 +109,34 @@ order) until the graph reaches `END`.
    `level_id`, `role`, `kind`, `attempt`, `model_constraint_allow`).
 3. Calls the kind-specific runner.
 4. Emits `node_finished` + `level_finished` with cumulative duration,
-   cost, and the output preview (first 200 chars from the level's
-   delta).
+   cost, the output preview (first 200 chars from the level's delta), and
+   `provider` / `model` — the model that *actually* answered.
+
+   Both are omitted for any level that made no LLM call: only
+   `PromptLevelRunner` and `ToolLoopLevelRunner` write them into the level
+   state, so a gate, verifier, aggregator or `human_approval` level has no
+   `model` key at all. That absence is load-bearing, not an oversight — the
+   canvas reads it as "this level called nothing" and keeps the level's role
+   glyph instead of painting a model's brand mark on it. Do not default the
+   field.
+
+   A `prompt` level can also omit them *without* being a gate: when its builder
+   returns a `static_output` (the `code_build` L1 brief, composed from the
+   user's confirmed features so a product's reference material cannot expand
+   the scope), the runner makes no model call. It sets `deterministic=true` on
+   the level state, which this step forwards as `deterministic: true` on
+   `level_finished`. A `prompt` level is the one a person expects a model to
+   have written, so the UI uses the flag to say "composed in code — no model
+   call" instead of leaving the tile looking like a missing mark. It is a third
+   state, distinct from both `model` present and a gate's silent absence.
+
+   `level_finished` fires on completion, which is too late for the node a
+   person is watching, so the *running* window is covered by the per-level
+   `routing_decision` at step 3 below: it names the model we intend to call.
+   `level_finished` then supersedes it, which is how a runtime paid→free
+   reroute becomes visible. On the failure path neither field is emitted —
+   the runner raised, so no delta exists, and the only other source is the
+   previous attempt's model, which would mislabel the crash.
 
 ### `kind: prompt` (`PromptLevelRunner`)
 
@@ -119,8 +145,17 @@ order) until the graph reaches `END`.
 2. Emits `agent_handoff` + `prompt_sent` when the builder declared them
    (suppressed on retries by the builder itself).
 3. Resolves the model via `resolve_model(level.model_constraint, routing_default)`
-   and emits `routing_decision` with the resolved tier / provider /
-   model / `constraint_source`.
+   and emits `routing_decision` with `level_id` and the resolved tier /
+   provider / model / `constraint_source`.
+
+   This is a *per-level* event and the reason the canvas can name a model on
+   a step that is still running. Its `model` is the intended one and can be
+   `""`: `preferred_model` is only pinned when the level named exactly one
+   model, or when a user cost tier narrowed a bare `paid:*` wildcard — so on
+   a run where the user picked a compute budget it is populated, and on a
+   free-band level it is not. Note the legacy job-level `routing_decision`
+   from `graph/orchestrator.py` carries no `level_id`; consumers must ignore
+   that one rather than attribute a whole-job model to a single level.
 4. Wraps the call in `event_bus.heartbeat(...)` for L4-class long
    generations.
 5. Calls `_call_with_ask_user(...)` — same `ask_user` clarification loop
