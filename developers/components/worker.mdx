@@ -2,7 +2,7 @@
 title: Worker
 description: The orchestrator. A Python LangGraph service that consumes the job queue,
   augments prompts with retrieved context, runs every paid job through the scenario
-  runtime, dispatches to free or paid models, and streams typed events back through...
+  runtime, dispatches each level to a model band, and streams typed events back thr...
 ---
 
 ## What it does
@@ -11,8 +11,9 @@ description: The orchestrator. A Python LangGraph service that consumes the job 
 - Runs the context engine before routing — pulls knowledge-hub augments and RAG-retrieved snippets into the prompt.
 - Routes paid jobs through `ScenarioOrchestrator`; see [Scenarios runtime](/developers/components/scenarios-runtime) for the engine and [Scenario execution](/how-it-works/scenario-execution) for the per-level walkthrough.
 - Tracks escalation state and per-conflict retry counts.
-- Emits typed `AgentEvent` JSON (including the Phase-4 `level_*`, `verifier_*`, `gate_decision`, `budget_*` events) to a Redis list and pubsub channel.
+- Emits typed `AgentEvent` JSON to a Redis list and pubsub channel — scenario lifecycle (`scenario_*`, `level_*`, `verifier_*`, `gate_decision`), routing (`routing_decision` with the per-level band, `model_fallback` when the band walks), approvals (`approval_requested`, `ask_user`), budget (`budget_*`), and artifacts (`file_created`, `final`, `vercel_deployed`). Payload contracts live in [HTTP API & event stream](/developers/reference/api-and-events).
 - Persists status, cost, and audit trail.
+- Parks every human gate as a durable `approvals` row — in-graph scope/clarify gates, `ask_user` tool calls, and the pre-graph confirmation gates alike — so a decision can land from the Action Dock, the `/approvals` page, or Slack, not only from the live stream.
 - Provisions per-project workspaces (clone, scaffold, trigger Vercel deploy).
 
 ## Retrieval collections
@@ -88,12 +89,15 @@ re-run to confirm a failure is not pre-existing.
 
 ## Model dispatch
 
-Free and paid model dispatch with health-ranked provider fallback.
+Model selection is per level and driven by data, not code. `config/model_catalog.yaml` is the single answer to *what exists, what it can do, what it costs*; `config/team_controls.yaml` decides what this deployment may use. The loader refuses to start when either file is missing — a silently degraded catalog once disabled every provider but Anthropic while everything looked configured.
 
-- **Free providers**: Ollama (local or remote), including thinking models.
-- **Paid providers**: Claude and OpenAI-compatible endpoints.
+- **Cost tiers** are `free → cheap → mid → frontier`. The user's compute budget on `/new` (Free / Cost-optimized / Frontier, default cheap) resolves to a *band per role* (`worker/worker/llm/tier_profiles.py`): frontier buys a frontier architect and executor while planning and review stay cheap; Cost-optimized runs every role cheap; Free flips dispatch to the quota-paced free pool.
+- **Capability before cost.** A band applies after the level's requirements (`require_features`, `min_context_tokens`) and is dropped if nothing survives — a cheaper model that cannot do the work is not a saving.
+- **Band walk on failure.** The resolved band travels as ordered `ModelCandidate`s. `call_paid_model` walks it strongest-first — crossing providers — before any provider default; a 401/403 marks that provider dead for the rest of the call, and an unfunded account (402, or Zhipu's 429-with-code-1113) skips the provider by name. A tool loop walks the band only until its first successful turn, after which the tool-call history is vendor-shaped and switching would corrupt it.
+- **Effort ladder.** Levels ask for `none → low → medium → high → max`; adapters translate per vendor. A missing rung rounds *up* (except `none`, a ceiling), and effort plus reasoning tokens are recorded per call.
+- **Free quota ledger.** Free tiers fail by refusing, so a shared Redis ledger paces requests and tokens per window across all workers (`worker/worker/llm/quota.py`); a model whose window is spent is skipped, not tried. Every ledger method degrades permissive on a Redis error.
 
-A failing provider is de-preferred for subsequent jobs until its health recovers.
+Provider health is still tracked — failures decay, and a failing provider is de-preferred until it recovers. The full mechanism, including the frontier band on the shipped catalog and the `model_fallback` event, is in [Model routing](/developers/reference/model-routing).
 
 ## Hierarchy invariants
 

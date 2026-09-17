@@ -6,27 +6,41 @@ description: The ingest service. Rust + Axum, stateless beyond Postgres-backed p
 
 ## What it does
 
-- Authenticates requests via Authorization-header API tokens against team policy.
+- Authenticates requests via Authorization-header API tokens against team policy (per-user and per-org rate limits; secrets/PII redaction at ingress).
 - Persists projects and workflows.
 - Enqueues every chat submission as a Redis job before any execution — the queue-first invariant.
 - Streams job events to clients over Server-Sent Events.
-- Probes models and wakes Ollama on demand.
-- Routes non-LLM intents (rules, facts, commands).
+- Routes non-LLM intents (rules, facts, commands), approvals, and Slack events.
+- Serves the model catalog with live free-tier quota, and the knowledge-hub query/edit surface behind the KB MCP server and the Atlas.
 
 ## Endpoints
+
+The full catalog — jobs (submit / status / stream / resume / cancel), workflows and prompts, projects, approvals, capabilities, work items, Slack, Atlas, and knowledge — is maintained in one place: [HTTP API & event stream](/developers/reference/api-and-events).
+
+The core ingest loop:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/v1/chat` | Submit a prompt. Returns `job_id`. |
 | `GET` | `/v1/jobs/:id` | Current job status. |
-| `POST` | `/v1/jobs/:id/resume` | Resume a job paused on an `ask_user` interrupt. |
 | `GET` | `/v1/jobs/:id/stream` | SSE: replays Redis backlog, then streams the live pubsub channel until the job finishes or errors. |
-| `GET`/`POST` | `/v1/workflows` | Workflow graph CRUD. |
-| `GET`/`POST` | `/v1/projects` | Projects CRUD. |
+| `POST` | `/v1/jobs/:id/resume` | Resume a job paused on an `ask_user` interrupt. |
+| `POST` | `/v1/jobs/:id/cancel` | User Stop. |
 | `GET` | `/v1/models` | The model catalog — every provider, flavour, effort rung and cost tier, with live free-tier quota from Redis. |
-| `GET`/`POST` | `/v1/ollama/*` | Ollama health and wake. |
-| `POST` | `/v1/command/intents` | Non-LLM intent routing. |
-| `GET` | `/healthz` | Liveness. |
+
+Legacy `GET|POST /v1/ollama/*` probe/wake endpoints still exist for the retired self-hosted stack, which nothing routes to on purpose anymore.
+
+## Slack ingestion
+
+`POST /v1/slack/events` (event subscriptions) and `POST /v1/slack/interactions` (approval and question buttons) make Slack a two-way front end. The load-bearing rules:
+
+- **Signature verification is the only inbound auth** — an unset `SLACK_SIGNING_SECRET` rejects every request, silently.
+- **Triage decides act vs. ignore.** Amos acts on a DM, an `@mention`, or a reply inside a thread it already holds a conversation in (`slack_threads` is the lookup; a top-level channel message is never a follow-up). Everything else is dropped without a word: its own posts (`bot_id` present), Slackbot posts (which carry no `bot_id` — they post as a *user*), messages with attachments (a canvas/screenshot is boilerplate around a link; the content reaches Amos through the ingest connector instead), any `subtype` (`message_changed` would re-run a whole turn on a typo fix), duplicate deliveries, and authors outside the workspace. Drop reasons are logged at debug and name the exact rule.
+- **One turn at a time per thread.** A second message while the first runs gets "still working on your previous message". Thread history is the worker's usual recency window, not the full Slack transcript.
+- **Thread identity is a table, not metadata.** `slack_threads` (primary key `channel, thread_ts` → `workflow_id`, `user_id`, `last_job_id`) exists because claiming a thread must be atomic — two near-simultaneous messages must not split the history — and because workflow metadata is rewritten on every append. The reverse user lookup uses a deliberately non-unique partial index: the column is nullable and duplicates are legal, so a unique index would fail `ensure_schema()` and prevent the worker from booting.
+- **Derived, not configured.** The workspace id and the bot's own user id come from a cached `auth.test` call — configuring them separately only creates drift that fails closed (every message refused as "outside the allowed workspace"). `SLACK_TEAM_ID` remains an override. The signing secret is the one credential nothing can derive; everything inbound 401s until it is set. Credentials live in one Secrets Manager secret (`cerebrum/connectors/slack`); the setup runbook is `docs/slack-ingestion.md`.
+
+
 
 ## KB retrieval embeds elsewhere
 

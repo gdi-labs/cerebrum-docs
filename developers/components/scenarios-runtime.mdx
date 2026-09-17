@@ -126,26 +126,48 @@ build), `typecheck`, `lint`, `unit_test`, `schema` (JSON Schema + Pydantic),
 
 ## Lifecycle events
 
-Worker emits both the legacy and the Phase-4 lifecycle events for one release.
-Frontend renders the new events via
+Worker emits both the legacy and the scenario lifecycle events. Frontend renders the new events via
 `apps/frontend/components/workflow/scenario-run-timeline.tsx`.
 
 | Event kind          | Payload highlights                                    |
 |---------------------|-------------------------------------------------------|
-| `scenario_started`  | `scenario_id`, `scenario_version`                     |
-| `scenario_finished` | `status: completed \| aborted`, `aborted_reason`, totals |
+| `scenario_started`  | `scenario_id`, `scenario_version`, `selection_reason`, level/edge/budget shapes |
+| `scenario_finished` | `status: completed \| aborted \| cancelled`, `aborted_reason`, totals |
+| `scenario_chained`  | `from_scenario_id`, `to_scenario_id`, `chain_depth` |
 | `level_started`     | `level_id`, `role`, `kind`, `attempt`, `model_constraint_allow` |
-| `level_finished`    | `ok`, `attempt`, `duration_ms`, `cost_usd`, `output_preview` |
+| `level_finished`    | `ok`, `attempt`, `duration_ms`, `cost_usd`, `output_preview`, `verdict`; optional `provider`/`model` (the model that actually answered — present only for levels that made an LLM call) and `deterministic` |
+| `routing_decision`  | per level: `level_id`, `provider`, `model` (intended, may be `""`), `tier`, `model_candidates` |
+| `model_fallback`    | `level_id`, `from_model`, `to_model`, `to_provider`, `reason` — the band walked and a later candidate answered |
+| `provider_fallback` | the coarser reroute from paid to free transport |
 | `verifier_started`  | `level_id`, `verifier_name`, `kind`                   |
 | `verifier_finished` | `passed`, `score`, `reasons`, `cost_usd`, `duration_ms` |
 | `gate_decision`     | `source_level`, `target_level`, `matched_expression` |
 | `budget_consumed`   | cumulative `total_cost_usd`, `total_tokens`, `total_duration_ms` |
 | `budget_exceeded`   | `limit_kind`, `limit_value`, `observed_value`         |
 
-Payloads contracts in
+Payload contracts in
 `worker/worker/runtime/agent_messages.py`.
 TypeScript mirror in
 `apps/frontend/lib/types/agent-event.ts`.
+The full catalog with semantics lives in [HTTP API & event stream](/developers/reference/api-and-events).
+
+## Runner semantics
+
+`ScenarioExecutor` dispatches each level to its kind runner; the per-kind behavior every consumer should know:
+
+- **`prompt` (`PromptLevelRunner`)** — resolves the prompt builder, resolves the model (emitting the per-level `routing_decision`), calls under a heartbeat for long generations, records cost/tokens, then post-processes: `l1_brief` emits Markdown directly; `l3_accept`/`fact_check` extract a PASS/FAIL verdict from a trailing ` ```control ` block (with one bounded repair-retry when it won't parse); terminal-output levels set the final output. A builder may return a `static_output` — a level composed entirely in code (the `code_build` L1 brief built from the user's confirmed features is the shipped case) — which sets `deterministic: true` and makes no model call.
+- **`tool_loop` (`ToolLoopLevelRunner`)** — the agentic file loop over `read_file` / `write_file` / `edit_file` / `list_dir` / `delete_file` / `finish`, up to `max_iterations` (default 40). Paid transport returns native tool-use blocks; the textual ` ```tool ` protocol over the free tier is available only when the *first* paid turn fails and the level allows it. The run's Stop flag is checked per turn. The band walk applies only until the first successful turn — the tool-call history is vendor-shaped after that.
+- **`verifier` (`VerifierLevelRunner`)** — no file-apply step (the loop already wrote to disk); builds a `VerifierContext` against the workspace and runs the declared verifiers (serial / parallel / race). Every failed verifier's reasons are stashed as `build_feedback` for the next builder attempt. `code_build` runs `build` plus the deterministic `route_reachability` gate (every App Router route navigable from `/`; orphan and misplaced routes flagged).
+- **`human_approval` / `human_feedback` (`HumanApprovalLevelRunner`)** — parks the graph via LangGraph `interrupt()`, packages the question (approval or the universal feedback contract), and resumes with the reply folded back per the level's `metadata.assign` (`intent_route` chaining or a state key).
+- **`fan_out`/aggregator (`FanOutLevelRunner`)** — runs children in parallel through the same executor, merges their level states, and applies the named aggregator; the parent's post-merge budget check is what stops a fan-out from slipping past the cap.
+
+## State persistence rules
+
+LangGraph persists a state channel **only when a node returns it in its delta** — a channel mutated in place but dropped from the return value silently reverts on every re-hydration (each `ask_user` resume, worker restart, and re-enqueue). This produced two real failures: a retry counter that reset mid-run (five build-verify laps against a budget of three), and an audit list that grew checkpoint writes quadratically (one run wrote 338 MB of checkpoints). Both fixes generalize into rules for new state:
+
+- If a node changes a mutable channel, **return it** — trackers return `(escalate, tracker)` so a caller cannot forget.
+- Full audit entries (whole prompt, raw response, tool calls) go to the `model_call_audit` Postgres sink, one row per call; graph state keeps only metadata, and the orchestrator reassembles the full list post-run.
+- A handle rather than data (an event bus, a sink, a client) stays **off** `ScenarioState` entirely and is reached through a ContextVar — declaring it on state would make it a checkpointed channel.
 
 ## Bundled scenarios
 
@@ -162,6 +184,15 @@ TypeScript mirror in
 Rubrics live alongside scenarios in
 `knowledge-hub/rubrics/`:
 `architecture_review_v1`, `fact_check_v1`, `rigor_v1`.
+
+## Authoring a scenario
+
+A scenario ships as YAML + prompt builders + (optional) rubric markdown. Rules that aren't obvious from the schema:
+
+- **Declare `examples:` (3–5 representative prompts) if the scenario should be reachable from the universal input.** The intent classifier matches submissions against this catalog; admin-only scenarios (e.g. `code_build_strict`) deliberately omit `examples` to stay out of it. Add the examples in the same PR that adds the scenario.
+- **`intent_routes:` are first-come.** Two scenarios claiming the same route is a hard load error. The `task` route is reserved for the tier-3 classifier rule — a plain "task" with no explicit route goes to `intent_classifier`, which picks by examples; direct callers should pin `scenario_id` or use a specific route.
+- **Chain depth is capped at 3**, and the classifier counts as one hop.
+- Non-conversational work types (`rule`, `fact`, `planner`, `metric`) bypass the orchestrator entirely.
 
 ## CI gate
 
@@ -212,7 +243,7 @@ All tests live at repo root `tests/`. The scenario runtime suite:
 Run from repo root with the worker venv:
 
 ```bash
-/Users/azat/labs/amos/worker/.venv/bin/python -m pytest tests/ -v
+worker/.venv/bin/python -m pytest tests/ -v
 ```
 
 Suite status as of 2026-05-13: 502 passing, 9 unrelated pre-existing failures

@@ -1,127 +1,54 @@
 ---
 title: Project Console (/projects)
-description: '## What it enables'
+description: 'A dedicated workspace per Amos-built project, separate from the global
+  Agent Workbench. A project is one abstraction above workflows: a long-running shared
+  context hosting concurrent, heterogeneous workflows from different people — one
+  p...'
 ---
 
-A dedicated workspace per Amos-built project, separate from the global Agent Workbench. Each project gets its own URL (`/projects/:slug`), its own KPI strip, its own workflow sidebar, its own conversation canvas, and its own ⌘K search. This is the surface long-running products like cachepool are driven from — every prompt, every file, every deploy belongs to one project rather than living as an isolated workflow in the global list.
+## The project list
 
-Concretely: a user lands on `/projects`, sees a card grid of all their projects with status, repo, branch, and last-edit timestamps, and opens one to a workspace that shows the project's full life — recent workflows, live activity, generated files, cost/time/tokens spent — all in one place. Selecting a workflow inside a project switches the canvas to a wider conversation lane (~1100px composer, vs. ~500px in the legacy three-panel Workbench) with the agent's scenario, graph, and live deployment preview rendered above the threads.
+`/projects` shows every project you can access as a card grid — status, repo,
+branch, and last-edit timestamps at a glance. Create a new project or open one
+into its console.
 
-### Refinement (2026-05-31): heterogeneity-aware command-bar console
+## The console
 
-The `/projects/:slug` console was reworked from a three-band poster header + single-card feed into a denser, professional layout that treats the project as **one abstraction above workflows** — a long-running shared context hosting **concurrent, heterogeneous workflows from different people** (e.g. one person's build alongside another's QA pass). What it now enables:
+Each project lives at its own URL with its own command bar, board, sidebar,
+and search:
 
-- **A single ~56px command bar** carries every fact exactly once. The old triple-redundancy — a synthesised hero sentence, an `idle` chip, and a six-tile KPI grid all repeating the same workflow/prompt counts — is gone. Counts live only in one inline stat ribbon (`N workflows · C/T prompts`).
-- **The who × what-kind mix is legible at a glance.** The command bar shows a contributor avatar stack (real faces via the team-override avatar) + active-kind chips (Build / QA / Research / Docs / Review), with running kinds pulsing. A single-author/single-kind project collapses this to a quiet `"Azat · Build"` so a focused project never looks busy; a mixed project expands and the board auto-groups by kind.
-- **The canvas fills space at 0 / 1 / many workflows.** A responsive card grid replaces the single-card feed (no more empty Mars-background void at one workflow); a 0-workflow **Launchpad** offers an inline composer instead of a lone button in a void.
-- **Each card/row answers who+what+state in one glance** via a fixed four-corner identity stamp: kind tile (top-left), status pill (top-right), author avatar (bottom-left), prompt numbers + progress underline (bottom-right). Three reserved colour zones — kind = scenario tone, status = status colour, author = avatar ring — so no element ever carries two meanings.
-- **`needs_attention` is now surfaced on `/projects`** (a completed-with-warnings job no longer reads as a clean "completed"), via a shared status module the rail/board/changelog/mix all consume.
+- **One command bar carries every fact once.** Project identity, a single
+  stat ribbon (`N workflows · C/T prompts`), repository link, the canonical
+  **+ Workflow** action, and ⌘K. No repeated counts.
+- **The who × what-kind mix is legible at a glance.** A contributor avatar
+  stack plus active-kind chips (Build / QA / Research / Docs / Review), with
+  running kinds pulsing. A focused single-author project collapses this to a
+  quiet `Azat · Build`; a mixed project expands it — and the board auto-groups
+  by kind.
+- **The board fills space at 0 / 1 / many workflows.** Every workflow renders
+  as a card answering who + what + state in one glance: kind tile, status
+  pill, author avatar, prompt progress. Group the board by Kind, Author, or
+  Status; one **Load more** advances everything together. A brand-new project
+  gets the **Launchpad** — an inline composer instead of a lone button.
+- **The sidebar** is a compact workflow rail (with its own status filter) over
+  an **Activity strip**: an actor-led, verb-led feed — `Azat · Build ·
+  completed · "…"` — of the project's recent state changes.
+- **⌘K** opens a project-scoped palette: fuzzy search over objectives and
+  workflow ids, with **+ Workflow** as the fallback when nothing matches.
+- **`needs_attention` is surfaced**, so a completed-with-warnings workflow no
+  longer reads as a clean "completed".
 
-### Refinement (2026-06-11): collapsible Workflows panel + latest prompt per row
+## Working inside a workflow
 
-The project dashboard's **Workflows** section (`apps/frontend/app/(authenticated)/projects/dashboard/project-workflows-list.tsx`/projects/dashboard/project-workflows-list.tsx)) now:
+Selecting a workflow switches the canvas to a wide conversation lane: summary
+tiles (cost / tokens / time / files / build), the live agent graph, the
+artifact preview of the deployed app, the generated-files list, and the prompt
+threads with their composer. New workflows started from inside the project are
+stamped as the project's own and appear in its list immediately.
 
-- **Collapses to its header, collapsed by default** — the dashboard leads with the deployment card; the header keeps the workflow count and the New-workflow action either way, and a caret toggle (rotates on expand) reveals the search box + rows.
-- **Shows the latest user prompt in each row**, truncated in muted text next to the (often auto-named) workflow title — so a row like `workflow:wf-188` also tells you what was last asked of it.
+## Managing a project
 
-Backing API change (additive): `WorkflowStatusResponse` gains `latest_prompt: Option<String>` — the newest `prompt_threads.prompt_text` per workflow, filled **only by the list query** (`GET /v1/workflows`) via a correlated subquery; single-workflow endpoints leave it null since they fetch full prompt threads separately. Paths: `mother-ai/src/models.rs`, `mother-ai/src/routes.rs` (`fetch_workflows_from_postgres`), zod schema in `apps/frontend/lib/schemas.ts`. Old clients are unaffected (`skip_serializing_if` on null; `.passthrough()` schema).
-
-### Refinement (2026-06-11): dashboard header — repo link for kind=new projects, Share, actions menu
-
-The dashboard tab bar (`apps/frontend/app/(authenticated)/projects/dashboard/project-dashboard.tsx`/projects/dashboard/project-dashboard.tsx)) gains:
-
-- **GitHub Repository link now shows for `kind=new` projects.** Root cause: the worker auto-provisions the GitHub repo for new projects but never backfills `projects.repo_url` (deliberately — feeding it back as `metadata.project.repo` on follow-up prompts would flip the worker's explicit-override path and disable repo auto-provisioning / `github_full_name` resolution, which Vercel self-heal depends on). Fix: mother-ai now lifts the public remote from the worker's push audit log (`job_runs.audit_log.project_push.remote_url`, falling back to `project_initial_push.remote_url`) into `metadata.project.repo_url` in **both** the single-workflow status query and `GET /v1/workflows` (`compose_workflow_metadata` in `mother-ai/src/routes.rs` — the list endpoint now runs the same overlay, which also makes `production_url` available to list consumers). The dashboard reads `project.repoUrl ?? deployment.repoUrl` (the `.git` suffix is trimmed for the browser link).
-- **Share button** (ShareNetwork icon) — copies the production URL (or the console URL pre-deploy) to the clipboard with a 1.5s "Copied" check flash.
-- **Actions menu** — a 3-dot trigger (radix `@radix-ui/react-dropdown-menu`, same pattern as the workflow rail rows) with a single **Delete** item. ~~Visual affordance only; deletion is not wired up yet.~~ Superseded same-day: Rename and Delete are both live — see the project-lifecycle refinement below.
-
-### Refinement (2026-06-11): project lifecycle — guaranteed binding, rename, delete, deployment duration
-
-**What it enables:**
-
-- **"+ New workflow" can no longer silently attach to a nonexistent project.** Workflow submissions carrying `metadata.project.slug` are validated against the `projects` table at enqueue time and the client's project snapshot (name/kind/base_branch/repo) is overwritten from the authoritative row — so the binding the `/projects` console relies on is server-guaranteed, not client trust.
-- **Rename a project** from the dashboard actions menu. Display name only — the slug (and the GitHub repo / Vercel project / workspace naming derived from it) is immutable. The server backfills `metadata.project.name` on every bound workflow in the same transaction, so legacy projects whose names were derived from the first prompt can finally be fixed, everywhere at once.
-- **Delete a project** (typed-name confirmation) — removes the project, all of its workflows, prompts, and run history from Amos. The GitHub repository, Vercel project, and any provisioned database are deliberately **not** touched; the dialog says so.
-- **The deployment card's Duration field is real** — workflow wall-clock (`completed_at − created_at`) of the deployment workflow, formatted via the shared `formatDuration`; an em dash while queued/running.
-
-**What's changed:**
-
-- mother-ai (`mother-ai/src/routes.rs`, `mother-ai/src/models.rs`):
-  - `validate_and_stamp_project_binding` runs in `submit_chat`, `create_workflow`, and `submit_command_intent` (not `append_prompt`, which inherits stored workflow metadata). Unknown slug → 404. `project.repo` is only stamped when `projects.repo_url` is set (kind=existing) so kind=new repo auto-provisioning stays intact; a workflow-pinned `design_system_id` beats the project default. Without a Postgres DSN (dev mode) validation is skipped.
-  - `PATCH /v1/projects/:slug` (`UpdateProjectRequest { name }`) — renames + backfills `workflow_runs.metadata.project.name` via `jsonb_set`, transactionally, **without** bumping `workflow_runs.updated_at` (protects `updated_at desc` keyset cursors).
-  - `DELETE /v1/projects/:slug` — one transaction: lock project row (`for update`, so rename/delete races serialize), delete `job_runs` by both linkage paths (no FK), delete `workflow_runs` (`prompt_threads` cascade via FK), delete the project row. Returns 200 + `{deleted, slug, workflows_deleted}` (the BFF proxy re-serializes JSON bodies, so no 204). Redis queue/status keys self-expire via TTL.
-  - `WorkflowStatusResponse.completed_at: Option<DateTime<Utc>>` — read from `workflow_runs.completed_at` in both the list and single-workflow Postgres queries; null on Redis fallback paths. Additive (`skip_serializing_if`).
-- worker (`worker/worker/storage/postgres_repo.py`): new expression index `idx_workflow_runs_project_slug` on `(metadata->'project'->>'slug')` — serves the project-scoped list, the rename backfill, and the delete cascade. Idempotent, added in `ensure_schema()`.
-- Frontend BFF: `PATCH`/`DELETE` handlers on [apps/frontend/app/api/projects/[slug]/route.ts](../../../../../apps/frontend/app/api/projects/[slug]/route.ts); `PATCH` joins the proxy method union in `apps/frontend/app/api/mother-ai/_shared.ts`.
-- Frontend client/UI: `updateProject` / `deleteProject` in `apps/frontend/lib/mother-ai-client.ts`; `completed_at` in the zod schema (`apps/frontend/lib/schemas.ts`); new `rename-project-dialog.tsx` + `delete-project-dialog.tsx` under `apps/frontend/app/(authenticated)/projects/dashboard/`/projects/dashboard/); the dashboard's actions menu wires both, and `projects-workbench.tsx` drops back to the projects rail after a delete. `deriveDeployment` computes `durationMs` consumed by `deployment-card.tsx`.
-
-**Impact scope:** all additive except one intentional behavior change — submitting a workflow with a `metadata.project.slug` that has no `projects` row now returns 404 instead of queueing. Workflows without project metadata are untouched. Delete is Amos-data-only; a job already running for a deleted workflow finishes and re-upserts a ghost workflow row carrying the dead slug (visible in the global `/workflows` list, 404 under the project) — accepted under the data-only scope. Rename is safe mid-flight: the worker's metadata upsert merges stored-wins (`excluded.metadata || stored`), so a completing job carrying the old name cannot clobber the backfill.
-
-**Tests:** `cargo test` in `mother-ai/` (5 new unit tests on the stamp function: identity refresh, repo None/Some, pass-through, design-system pinning — 23 total green); worker suite `worker/.venv/bin/python -m pytest tests/ -v` stays 0-fail; `tsc --noEmit` + biome clean in `apps/frontend`.
-
-## What's changed
-
-### Backend (mother-ai)
-
-- `GET /v1/projects/:slug` — single-project lookup by collision-free slug. Returns `ProjectRecord` (id, name, slug, kind, repo_url, base_branch, created_by, timestamps). Path: `mother-ai/src/routes.rs`.
-- `GET /v1/workflows?project_slug=<slug>` — new optional filter on the existing list endpoint. Applies to both page rows and `total_count`, using a `metadata->'project'->>'slug'` JSON path filter at the SQL layer. The handler's optional-clause builder was refactored to a running param-index counter so the next filter we add slots in without re-indexing `$N` positions.
-- `ListWorkflowsQuery.project_slug: Option<String>` added to `mother-ai/src/models.rs`.
-
-### Frontend BFF
-
-- `GET /api/projects/[slug]` proxies the new mother-ai endpoint through `requireApiUser` ([apps/frontend/app/api/projects/[slug]/route.ts](../../../../../apps/frontend/app/api/projects/[slug]/route.ts)).
-- `GET /api/mother-ai/workflows` now forwards `project_slug` when present (`apps/frontend/app/api/mother-ai/workflows/route.ts`).
-
-### Frontend client
-
-- `getProject(slug)` and a new `projectSlug` argument on `listWorkflows()` in `apps/frontend/lib/mother-ai-client.ts`.
-- `useWorkflowSession(workflowId)` hook in `apps/frontend/lib/workflow/use-workflow-session.ts` lifts the workflow status + prompts + active-job SSE + scenario-derived state out of `WorkflowPanels` so both the legacy Workbench and the new console share one source of truth. (A prior commit had already updated `WorkflowPanels` to import this hook without committing the file itself — this change unbreaks HEAD.)
-- "Projects" nav entry added between Workbench and Atlas in `apps/frontend/components/layout/app-header.tsx`.
-
-### Frontend route surface
-
-All under `apps/frontend/app/(authenticated)/projects/`/projects/):
-
-- `page.tsx` — `/projects` index, max-w-[1680px] frosted-card layout with a 1–3 column responsive project grid.
-- `projects-list-view.tsx` — list view + create-new modal (`POST /api/projects`).
-- `[slug]/page.tsx` + `[slug]/project-detail-view.tsx` — the per-project shell. Command bar on top, collapsible sidebar (workflows + activity) on the left, mode-driven canvas on the right (launchpad / board / detail), ⌘K palette and new-workflow dialog overlaid. Holds the lifted status-filter state (shared rail + board), the board `groupBy` state (localStorage `amos:projects:board-groupby`, with an auto-vs-explicit default), the mix `focus` state, and ESC-to-deselect.
-- `[slug]/project-header.tsx` — the ~56px **command bar**: identity + `ProjectMixSummary` + one stat ribbon (the only place counts live) + a quiet Setup popover (repo/branch real; db/scenario as muted `configure →` placeholders, never coloured fake status) + ⌘K + the one canonical `+ Workflow` CTA. Replaces the old hero sentence + `LastActivityBadge` + six-tile KPI grid.
-- `[slug]/project-mix-summary.tsx` — the command-bar who × what-kind roll-up: contributor avatar stack (max 4 + `+N`) + active-kind chips (running kinds pulse) + a liveness token; collapses to inline `"Azat · Build"` when calm; clicking an avatar/chip sets a soft board focus (filter-only). Exports the `MixFocus` type.
-- `[slug]/use-project-workflows.ts` — shared `useInfiniteQuery` hook + `aggregateProjectStats` + new `aggregateProjectMix` (contributors / kinds / `isHeterogeneous`, derived purely from loaded pages, no extra fetch). Sidebar, command bar, board, activity strip, and ⌘K palette all consume the same React Query cache key (`["project-workflows", slug]`).
-- `[slug]/project-workflow-sidebar.tsx` — compact nav rail. Now prepends a per-row identity stamp (kind glyph + author avatar — author is no longer constant within a project), consumes the shared status module (so `needs_attention` shows), lifts its status filter up to the shell, and owns its single header (with the `⊕` new-workflow and `‹` collapse controls) — the redundant stacked `PROJECT` band above it is removed.
-- `[slug]/project-changelog.tsx` — the **Activity strip** (kept visible in the sidebar footer): an actor-led, verb-led chronological feed — `Azat · Build · completed · "…"` — last 12 state changes, using the same avatar + kind vocabulary as the cards. No counts (orthogonal to the mix summary).
-- `[slug]/project-workflow-board.tsx` — the no-selection canvas (replaces `workflow-showcase-feed.tsx`): every loaded workflow as a four-corner identity card in a responsive grid (`grid-cols-1 lg:grid-cols-2 3xl:grid-cols-3`), segmented in place by Kind / Author / Status / None via a `Group:` control, over the one shared cursor (one `Load more` sentinel re-buckets all sections — no per-lane pagination). Keeps the showcase card body + `useQueries` 6-card preview-fetch cap.
-- `[slug]/project-launchpad.tsx` — the 0-workflow canvas: an inline `ComposerTextarea` wired to the same `submitChat({ project })` path the dialog uses (routes through ScenarioOrchestrator), instead of a lone button in a void.
-- `lib/scenario-kind.ts` — `bucketKind(scenario_id)` → Build/QA/Research/Docs/Review/Ops/Other (+ `KIND_ORDER`, `kindVisual`), the label-side sibling of `scenarioIcon`. The kind axis of project heterogeneity.
-- `lib/workflow-status.ts` — shared status vocabulary (`effectiveStatus` with `needs_attention`, `statusColor`/`statusDot`/`statusLabel`/`statusToFilter`, `STATUS_FILTERS`, `relativeTime`) lifted from `JobsListPanel` and consumed by the /projects surfaces; `/workflows` keeps its own copies untouched (no regression on the reference page).
-- `[slug]/selected-workflow-canvas.tsx` — when a workflow is selected, mounts (in order): slim header, `StatusTicker`, `WorkflowSummaryTile` (cost/tokens/time/files/build), reused `ScenarioHeader`, reused `AgentGraphCard`, `ArtifactPreview` (iframe of `metadata.project.production_url` when set, dashed placeholder otherwise), collapsible `FilesGenerated` list, and the existing `JobContextPanel` (threads + composer). Per-status radial-gradient hue on the canvas.
-- `[slug]/new-workflow-dialog.tsx` — submits via `submitChat({ project: {…} })` so the resulting workflow is stamped with `metadata.project.slug` and surfaces immediately in the project's own list.
-- `[slug]/project-cmd-k.tsx` — project-scoped ⌘K palette. Arrow-key navigation, fuzzy search on objective + workflow id, "+ Workflow" fallback when nothing matches.
-
-## Impact scope
-
-- **Affected subsystems**: mother-ai (Rust HTTP layer), Next.js BFF + UI. Worker unchanged. Auth/permissions inherit the existing `requireApiUser` + non-admin `created_by` scoping.
-- **Backwards compatibility**: the new `project_slug` query param is optional; callers that don't pass it see exactly the same behaviour as before. Existing workflows that already carry `metadata.project` on the worker side become filterable immediately — no backfill required.
-- **Defaults**: `/projects` is visible to every signed-in user. Workflows created via the new "+ Workflow" button are stamped with the project metadata automatically. The ⌘K palette only activates when focus is on a `/projects/:slug` page.
-- **Auto-runs**: none. No new cron jobs or background workers; the page polls via React Query with the same active/idle intervals the Workbench uses (2s while anything is running, 6s idle).
-- **Known stubs (slots reserved, follow-ups tracked elsewhere)**:
-  - `db` / `scenario` in the Setup popover — quiet `configure →` placeholders (no backing field yet); wire to DB provisioning / scenario live-edit when those land. No longer rendered as coloured fake status in the header.
-  - Composer attachment dropdown items remain `console.info` stubs.
-  - Pinned/featured workflows not yet implemented.
-  - The mix summary and aggregates summarise **loaded pages only** (one shared cursor); a large project under-reports kinds/people until more pages load — the `+N` chip signals there may be more. No separate count endpoint.
-  - A fuller extraction of `WorkflowRow`/`WorkflowList` into shared components (so `JobsListPanel` consumes them too) is a deliberate follow-up — out of scope here to avoid regressing `/workflows`.
-
-## Tests
-
-- **Rust**: `cd mother-ai && cargo check` — passes. No new unit tests added; the new SQL filter is exercised end-to-end via the FE.
-- **TypeScript**: `cd apps/frontend && npx --no-install tsc --noEmit` — passes.
-- **Biome**: `cd apps/frontend && pnpm run lint` (or `npx --no-install biome check`) — passes.
-- **Build**: `cd apps/frontend && pnpm build` — passes (exit 0).
-- **Manual verification path**:
-  1. `cd apps/frontend && pnpm dev`
-  2. Visit `/projects`, click "+ New project", create one (slug `console-test` for example).
-  3. Open `/projects/console-test` with no workflows → the **Launchpad** composer (not an empty void); submit a prompt and confirm it appears in the rail + board.
-  4. With ≥1 workflow → the **board** card fills its column (no Mars void); confirm the command bar's stat ribbon is the only place counts appear (no hero sentence / KPI grid). Hit ⌘K to confirm the palette opens.
-  5. Heterogeneity: with workflows from two people / two kinds, confirm the command bar shows a contributor avatar stack + kind chips and the board auto-groups by Kind; a single-author/single-kind project collapses the summary to `"Azat · Build"` and shows a flat grid. Switch the `Group:` control (Kind/Author/Status/None) and click an avatar/kind chip to focus-filter.
-  6. Select a workflow → the canvas swaps to the detail view (summary tile / scenario card / agent graph / artifact preview / files / composer); the rail + command bar persist; the selected rail row gets the cyan border; press ESC to return to the board. Confirm a completed-with-warnings job renders as `needs attention` on the rail.
-  7. Visit `/workflows` and confirm the Agent Workbench list is unchanged (the shared status module is consumed only by /projects).
-- **No pre-existing test regressions introduced** by this UI refinement.
+Rename or delete a project from its actions menu (delete cascades its
+workflows), and jump straight to the GitHub repository from the command bar —
+the repo link is backfilled from the first push, so it appears for
+auto-provisioned projects too.

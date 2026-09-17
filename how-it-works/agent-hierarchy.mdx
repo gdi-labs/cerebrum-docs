@@ -1,19 +1,20 @@
 ---
 title: The agent hierarchy
-description: '> Implementation note (2026-05-13). The L1/L2/L3/L4 split below > remains
-  the conceptual shape of code-build runs but is no longer > hardcoded in the worker.
-  Every flow — code, writing, research, > security, Q&A — is now a versioned YAML...'
+description: '> How this fits together (2026-05-13). The four levels below are the
+  > default shape for code-building runs. Every flow — code, writing, > research,
+  security, Q&A — is defined as a declarative scenario, and > non-code flows typically
+  use...'
 ---
 
 Amos's agents aren't a flat pool. They're organized in four levels, each with a defined role.
 
 ## L1 — Team Lead
 
-Free-model orchestration. Reads the request, classifies it, and decides whether it's routine (stays inside free) or non-trivial (escalates to L2). Delegates work, doesn't execute it.
+Orchestration. Reads the request, classifies it, and decides whether it's routine or non-trivial (escalates to L2). Delegates work, doesn't execute it.
 
 ## L2 — Managerial roles
 
-Paid-model leadership. Specializes by role:
+Leadership. Specializes by role:
 
 - **Architect** — system design and structural decisions.
 - **Tech Lead** — implementation plans and code-level direction.
@@ -24,11 +25,11 @@ L2 doesn't execute either. It plans and routes work to L4.
 
 ## L3 — Acceptance
 
-Free-model verification. Reads the executor's output and checks it against the original ask. Returns pass/fail with deltas (what's missing, what needs revision). It doesn't rewrite.
+Verification. Reads the executor's output and checks it against the original ask. Returns pass/fail with deltas (what's missing, what needs revision). It doesn't rewrite.
 
 ## L4 — Executor
 
-Paid-model production. Specializes in file writes — emits net-new files and surgical edits — and streams tokens with periodic heartbeats so long generations stay alive end-to-end.
+Production. Specializes in file writes — emits net-new files and surgical edits — and streams its output as it works, with keep-alive signals so long generations don't stall.
 
 ## How escalation works
 
@@ -36,23 +37,31 @@ Within a level, conflicts retry up to three times. After three failures, the con
 
 ## Why this shape
 
-- **Free models do orchestration cheaply.** L1 (classify) and L3 (verify) don't need a paid model, and using one would waste cost.
-- **Paid models do actual work.** L2 plans, L4 builds. The hardest tokens land on the best model.
+- **Planning and review are short, well-structured tasks.** They don't need the most expensive model, and under a frontier budget they deliberately don't get one — the budget concentrates where model quality shows.
+- **Building is where the model matters.** L2 plans and L4 builds; a frontier budget buys frontier quality exactly there.
 - **Acceptance is separated from execution.** The same agent doesn't get to grade its own work.
+
+Which model tier serves each level follows the budget you pick (see [Free and paid models, together](/capabilities/multi-model)) — the hierarchy is about responsibility, not a fixed cost assignment.
 
 ## Beyond code
 
-The L1/L2/L3/L4 shape suits *code* flows. Non-code flows aren't shaped
+The four-level shape suits *code* flows. Non-code flows aren't shaped
 the same way:
 
-- **`document_writing`** is an editorial chain (outline → research →
-  draft → fact_check → polish).
-- **`research_brief`** is a fan_out across specialist subdomains (web,
-  internal KB, academic) joined by a synthesis level.
-- **`security_review`** is a triage + parallel static scans + LLM
-  analyst + human approval + final report pipeline.
-- **`quick_qa`** is a single free-tier level with a schema verifier.
+- **Document writing** is an editorial chain (outline → research →
+  draft → fact-check → polish).
+- **Research briefs** fan out across specialist subdomains (web,
+  internal knowledge, academic) and join the results with a synthesis
+  step.
+- **Security review** is a pipeline: triage, parallel scans, analyst
+  review, human approval, and a final report.
+- **Quick Q&A** is a single fast level with an automatic format check.
 
-These all run on the same scenario engine. The L1/L2/L3/L4 layering
-remains the *default convention* for `code_build` and
-`code_build_strict`; everything else picks its own level ids.
+These all run on the same scenario engine. The four-level layering
+remains the default convention for code-building runs; everything else
+picks its own arrangement.
+
+## Under the hood
+
+The scenario runtime that arranges agent levels per flow is described in
+[Scenarios runtime](/developers/components/scenarios-runtime).

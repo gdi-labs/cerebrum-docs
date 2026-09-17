@@ -1,0 +1,86 @@
+---
+title: Configuration
+description: The files and environment variables that shape a deployment. Names and
+  purpose only — values (keys, DSNs, secrets) live in Terraform-managed AWS Secrets
+  Manager secrets and never in the repo.
+---
+
+Two conventions matter more than any single variable:
+
+- **Behavior is data where possible.** What models exist, what they cost, what a team may use, and how agent flows are shaped are YAML files, not code — see [Model routing](/developers/reference/model-routing) and the [scenarios catalog](https://github.com/gdi-labs/cerebrum) in the hub.
+- **Env arrives via `envFrom.secretRef`.** A `terraform apply` updates the Kubernetes Secret, but pods keep stale values until the deployment is rolled (`kubectl rollout restart`). Worth knowing during any config change that "didn't take".
+
+## Config files (repo `config/`)
+
+| File | Read by | Purpose |
+| --- | --- | --- |
+| `model_catalog.yaml` | worker, telemetry-api | The model roster: providers, models, capabilities, prices, quotas, effort maps. Load-time invariants fail fast — the worker refuses to start without it. |
+| `team_controls.yaml` | worker, mother-ai | What this deployment may use: provider allowlist and rate limits. A **hard filter** over the catalog. |
+| `control_plane.yaml` | mother-ai, worker | Deployment/instance identity and shared control-plane settings. |
+| `architecture_defaults.yaml` | worker | Defaults for agent-built architectures (design-system pinning and friends). |
+
+The catalog paths must be **absolute** in any container (`MODEL_CATALOG_PATH`, `TEAM_CONTROLS_PATH`) — a relative default once resolved to nothing and silently disabled every provider but Anthropic.
+
+## Mother AI (Rust ingest)
+
+| Variable | Purpose |
+| --- | --- |
+| `REDIS_URL`, `JOB_QUEUE_KEY` | Queue connection and the pinned queue key. |
+| `POSTGRES_DSN` | Durable workflow/project status; also switches id allocation from Redis counters to Postgres sequences. |
+| `MOTHER_AI_BIND_ADDR`, `MOTHER_AI_API_KEY` | Listen address; API-token auth. |
+| `TEAM_CONTROLS_PATH`, `CONTROL_PLANE_CONFIG_PATH`, `PROJECT_ID` | Policy files and instance identity. |
+| `SLACK_SIGNING_SECRET`, `SLACK_BOT_TOKEN`, `SLACK_TEAM_ID` | Slack ingestion: signature verification (an empty secret rejects every request), posting, workspace resolution. |
+| `CEREBRUM_APP_BASE_URL` | Canonical app origin used in Slack links and redirects. |
+| `RUST_LOG` | Tracing verbosity — unset means the TraceLayer logs nothing, which once hid inbound Slack failures. |
+
+## Worker (Python orchestrator)
+
+| Group | Variables | Purpose |
+| --- | --- | --- |
+| Queue & stores | `REDIS_URL`, `JOB_QUEUE_KEY`, `POSTGRES_DSN`, `QDRANT_URL`, `QDRANT_API_KEY`, `QDRANT_COLLECTION` | The three backing stores; `QDRANT_COLLECTION` defaults to `cerebrum_knowledge_hub`. |
+| Model catalog | `MODEL_CATALOG_PATH`, `TEAM_CONTROLS_PATH` | Absolute paths, enforced. |
+| Provider keys | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `ZHIPU_API_KEY`, `MOONSHOT_API_KEY`, `MINIMAX_API_KEY`, `GROQ_API_KEY`, `OPENROUTER_API_KEY` (+ optional `ANTHROPIC_HTTP_PROXY` for geo-blocked regions) | Per-provider credentials; a Secrets Manager `secret_id` (`*_AUTH_SECRET_ID`) can stand in for any of them. |
+| Provider defaults | `*_CHAT_MODEL`, `PAID_PROVIDER_ORDER` | Per-provider default model and legacy provider ordering (superseded by the catalog when it loads). |
+| Retrieval | `EMBEDDING_PROVIDER`, `EMBED_DIMENSIONS`, `OPENAI_EMBED_MODEL`, `OLLAMA_*` | One embedder for the whole system; `hash` is CI-only and refused against non-local Qdrant. |
+| Scenarios | `AMOS_DEFAULT_SCENARIO` | Default flow when a job pins neither `scenario_id` nor a mapped `intent_route`. |
+| Gate behavior | `CEREBRUM_CONFIRM_INTENT`, `CEREBRUM_SCOPE_CONFIRM` (+ `_THRESHOLD`), `CEREBRUM_CLARIFY_REQUIREMENTS`, `DESIGN_CONFIRM` (+ `_THRESHOLD`) | Which pre-graph/in-graph human confirmations run, and their confidence thresholds. |
+| Build sandbox | `BUILD_*` (timeouts, retries, package manager, output tail), `CEREBRUM_DB_MIGRATE_CMD` | The verifier subprocess envelope. |
+| Self-repo & provisioning | `CEREBRUM_SELF_REPO_*`, `CEREBRUM_PROJECT_*`, `GIT_AUTHOR_DOMAIN` | Workspace provisioning and push identity. |
+| Knowledge hub | `KNOWLEDGE_HUB_REFRESH_SECONDS` | In-cluster hub refresh cadence for retrieval (default 300 s). |
+| Slack & app origin | `CEREBRUM_APP_BASE_URL` | Canonical origin for links the worker posts into Slack threads. |
+
+## Auth service
+
+Documented on its component page — see [Auth](/developers/components/auth). The load-bearing ones: `BETTER_AUTH_COOKIE_DOMAIN` (must be a parent of every app host), `TRUSTED_ORIGINS` (CORS + Better Auth allowlist), `ADMIN_EMAILS` (auto-promotion), `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` (the OAuth client is manual external state — its redirect URIs live in Google Cloud Console, not Terraform).
+
+## Frontend (Next.js on Vercel)
+
+| Variable | Purpose |
+| --- | --- |
+| `MOTHER_AI_BASE_URL`, `MOTHER_AI_API_KEY` | The BFF's upstream. |
+| `AUTH_BASE_URL`, `NEXT_PUBLIC_AUTH_BASE_URL` | The auth service — server-side (preflight, admin proxy) and browser (sign-in client) respectively. |
+| `NEXT_PUBLIC_APP_BASE_URL` | Canonical origin for links. |
+| `NEXT_PUBLIC_ENABLE_PASSWORD_LOGIN` | Whether the password form renders (the endpoint's availability is the auth service's decision, not this flag's). |
+| `TELEMETRY_API_BASE_URL`, `TELEMETRY_API_KEY` | Telemetry queries (cost panels, run history). |
+| `VERCEL_API_KEY`, `VERCEL_TEAM_SLUG` | Deployment status and self-heal probes. |
+| `PEXELS_API_KEY` | Work-item tile imagery. |
+| `META_APP_ID`, `META_OAUTH_REDIRECT_URI`, `META_OAUTH_STATE_SECRET` | Meta Ads integration. |
+
+## Internationalization (frontend)
+
+- **Slug ↔ tag split.** URL prefixes and message files use slugs (`en`, `cn`); the internal locale tag (`en`, `zh-Hans`) differs on purpose — `cn` is a region code, not a language, and `Intl` silently falls back on it (`new Intl.NumberFormat("cn")` resolves to en-US formatting). `lib/i18n/config.ts` is the single registry tying slug, tag, and display label together; its test asserts every tag survives `Intl`.
+- **Routing.** next-intl with `localePrefix.prefixes` (`/cn` is a custom prefix), always-prefixed routes, a one-year locale cookie, and locale detection on — a `zh-*` browser 307s to the prefixed path. `lib/i18n/navigation` returns slug-**stripped** pathnames, so anything reading a path must keep receiving the stripped form. Static redirects in `next.config.ts` must duplicate the slug alternation (`/:slug(en|cn)/…`) because `redirects()` runs before the proxy and cannot read the registry.
+- **Adding a language.** Add the BCP-47 tag to `LOCALES`, the slug to `LOCALE_SLUGS`, its own-language label, a `messages/<slug>.json` catalog, and the slug to the redirect alternation. The registry/messages tests fail until all of it lands; catalog parity is asserted including **ICU argument names as sets** (plural categories differ — Chinese has no `one`).
+- **Gotcha.** Next 16.1.6's `experimental.globalNotFound` does not compile under Turbopack — it was removed rather than fought.
+
+## Ingest (hub pipeline)
+
+| Variable | Purpose |
+| --- | --- |
+| `QDRANT_URL`, `QDRANT_API_KEY`, `QDRANT_COLLECTION` | Vector store target. |
+| `EMBEDDING_PROVIDER`, `OPENAI_API_KEY`, `OPENAI_EMBED_MODEL` | The one embedder; hosted by default, Ollama fallback retained for rollback (a rollback requires a re-embed — vectors move with the model). |
+| `POSTGRES_DSN` | The `kb_documents`/manifest bookkeeping. |
+
+## Kubernetes & Terraform
+
+Deployments are provisioned by `terraform/modules/*` (workers, auth, qdrant, provider-secrets, cerebrum-workloads). Provider keys are Secrets Manager secrets under `cerebrum/providers/*` — Terraform owns the naming; pre-existing secrets must be imported before Terraform manages them. In-cluster secrets reach pods via `envFrom.secretRef` (see the rollout gotcha above). The docs site itself is configured by the exporter — see the [Mintlify export runbook](https://github.com/gdi-labs/cerebrum/blob/master/docs/mintlify-export.md).

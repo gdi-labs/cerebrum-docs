@@ -15,27 +15,33 @@ description: Amos is a queue-first AI orchestration platform. It runs a multi-ag
 
 - **[Mother AI](/developers/components/mother-ai)** — stateless ingest service (Rust/Axum). Authenticates requests, persists projects/workflows, enqueues jobs, streams events.
 - **[Worker](/developers/components/worker)** — orchestrator (Python/LangGraph). Pulls jobs, runs the context engine, dispatches through an L1–L4 agent hierarchy, emits typed events.
+- **[Auth](/developers/components/auth)** — identity and authorization service (Hono + Better Auth). Owns sign-in, sessions, roles, budgets, and all auth database access; the frontends hold no credentials.
 - **[Frontend](/developers/components/frontend)** — dashboard (Next.js / React). Renders live job streams, projects, workflows, and a 3D knowledge atlas.
 - **[Ingest](/developers/components/ingest)** — knowledge-hub pipeline. Reads markdown, chunks, embeds, upserts into Qdrant.
 - **[Knowledge Hub MCP](/developers/components/mcp-amos-kb)** — read-only stdio MCP server. Exposes the knowledge hub to any MCP client (Claude Desktop, Claude Code, agents, partner tools).
 
+Deeper component pages: [Scenarios runtime](/developers/components/scenarios-runtime) (the declarative flow engine), [Intent classifier](/developers/components/intent-classifier), [Connectors](/developers/components/connectors), [Job telemetry](/developers/components/job-telemetry), [QA answer panel](/developers/components/qa-answer-panel), [Agent workbench](/developers/components/agent-workbench), [Composer model picker](/developers/components/composer-model-picker), [L4 ask-user](/developers/components/l4-ask-user), [External tools platform](/developers/components/external-tools-platform), [Diaries](/developers/components/diaries), and [Notion ingest](/developers/components/notion-ingest).
+
 ## Core flow
 
-1. Client submits a prompt to **Mother AI**.
-2. Mother AI authenticates, persists project metadata, enqueues a job in Redis.
-3. **Worker** pulls the job, runs the context engine, classifies, dispatches through L1–L4.
-4. Worker emits typed `AgentEvent` JSON to a Redis stream.
-5. Frontend (or any client) subscribes via Mother AI's `GET /v1/jobs/:id/stream` and renders backlog + live events.
-6. Worker persists job state, audit trail, and escalation history.
+1. A user signs in through the **Auth** service; every app host shares the session cookie, and the frontend's BFF resolves identity plus budget/ownership checks against Auth's preflight guard.
+2. Client submits a prompt to **Mother AI**.
+3. Mother AI authenticates, persists project metadata, enqueues a job in Redis.
+4. **Worker** pulls the job, runs the context engine, classifies, dispatches through L1–L4.
+5. Worker emits typed `AgentEvent` JSON to a Redis stream.
+6. Frontend (or any client) subscribes via Mother AI's `GET /v1/jobs/:id/stream` and renders backlog + live events.
+7. Worker persists job state, audit trail, and escalation history.
+
+The event envelope and every payload contract are documented in [HTTP API & event stream](/developers/reference/api-and-events); storage layout in [Data model](/developers/reference/data-model); runtime configuration in [Configuration](/developers/reference/configuration).
 
 ## Hierarchy
 
-- **L1 — Team Lead** (free model): orchestration only — classify, plan, delegate.
+- **L1 — Team Lead**: orchestration only — classify, plan, delegate.
 - **L2 — Managerial roles**: Architect, Tech Lead, Release Manager, QA / Security / Adversarial leadership.
-- **L3 — Acceptance**: free-model verifier; pass/fail with deltas, not rewrites.
-- **L4 — Executor**: paid-model file-write specialist; emits net-new files and surgical edits.
+- **L3 — Acceptance**: verifier; pass/fail with deltas, not rewrites.
+- **L4 — Executor**: file-write specialist; emits net-new files and surgical edits.
 
-Routing is policy-driven: housekeeping prompts → free; architecture, implementation, high-risk → paid. Same-level conflicts retry up to 3 times before escalating upward.
+Which model serves each level is decided per level, not per job. The budget a user picks on `/new` — **Free, Cost-optimized (default), or Frontier** — resolves to a *band per role*: Frontier buys a frontier architect and executor while planning and review stay cheap; Cost-optimized runs every role on cheap models; Free rides the quota-paced free pool. Within a band, capability requirements filter first, then the strongest (or cheapest, for short well-structured work) model wins. When a routed model's request fails, dispatch walks the band strongest-first before any provider default. Same-level conflicts retry up to 3 times before escalating upward. The full mechanism — tier profiles, bands, failover, the effort ladder, and the free-quota ledger — is in [Model routing](/developers/reference/model-routing).
 
 ## Models
 
@@ -43,7 +49,8 @@ Which models exist and what they can do is **data**, in `config/model_catalog.ya
 
 - **Free**: hosted free tiers, reached through the Groq and OpenRouter routers (`openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `minimax/minimax-m3:free`, `z-ai/glm-5.2:free`). Free means a *quota*, not free hardware — these fail by refusing, so a shared Redis ledger paces them across workers and a model whose window is spent is skipped rather than tried.
 - **Paid**: Claude (`claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`), DeepSeek (`deepseek-v4-flash`, `deepseek-v4-pro`), GLM (`glm-5.2`), Kimi (`kimi-k3`), MiniMax (`minimax-m3`). Ten of the eleven providers speak the same HTTP shape, so adding one is usually a catalog row and no code.
-- **Cost tiers** are `free → cheap → mid → frontier`, and selection is cheapest *capable* first — a cheaper model that cannot do the work is not a saving.
+- **Cost tiers** are `free → cheap → mid → frontier`, and selection is cheapest *capable* first — a cheaper model that cannot do the work is not a saving. A tier choice resolves to a *band* of models (frontier currently: `claude-opus-4-8`, `claude-opus-4-7`, `kimi-k3`, `glm-5.2`), strongest first.
+- **Model fallback**: when a routed model's request fails, dispatch walks the band — next model on the same provider, then the band's other providers — before any default or a level failure. A refused credential (401/403) skips the rest of that provider's candidates in one step.
 - **Provider fallback** is health-ranked, and tells a spent quota, an unfunded account and a missing capability apart, because the right response to each differs.
 
 Self-hosted inference (the Ollama stack and its GPU node) is **being retired** — it is no longer a model source anything routes to on purpose.

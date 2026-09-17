@@ -99,6 +99,27 @@ python -m worker.scripts.seed_tool_secret \
 `SecretsManagerToolProvider` is a stub that raises `NotImplementedError`
 loudly so a premature switch in Phase 2 is loud, not silent.
 
+### Shipped credential shapes (EKS)
+
+- **`aws_default` → `ref_kind=default_chain`** (not `env`). The resolver
+  returns `{}`, which `build_boto3_session` treats as "use the boto3 default
+  credential chain" — the worker pod's IRSA identity
+  (`cerebrum-worker-irsa`, `ReadOnlyAccess`). With `ref_kind=env` every
+  `aws_*` tool fails with `ToolSecretError` yet the run **still reports
+  `COMPLETED` with an empty report** — a silent failure that reads as a
+  successful run.
+- **`slack_bot` → `ref_kind=secrets_manager`** pointing at
+  `cerebrum/connectors/slack` (`{token, signing_secret, default_channel}`).
+  `default_channel` is mandatory — the publish prompt deliberately omits
+  `channel` so the tool fills it in. The bot must also be **invited to that
+  channel**: for a private channel a non-member bot gets `channel_not_found`
+  (not `not_in_channel`), which reads like a bad channel id but is a
+  membership problem.
+- The same Slack app also serves inbound conversation
+  ([Slack Conversation](/capabilities/slack-conversation)), which needs
+  additional scopes; adding scopes requires **reinstalling** the app, which
+  rotates nothing but briefly touches the token this feature reads.
+
 ## Runner integration
 
 Two surgical edits in

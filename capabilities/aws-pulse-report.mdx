@@ -1,98 +1,51 @@
 ---
 title: AWS Pulse Report
-description: A daily-cadence operations scenario that audits an AWS account via read-only
-  API calls, synthesizes a Markdown summary, and posts a Block Kit version to Slack
+description: A daily-cadence operations report that audits an AWS account via read-only
+  calls, synthesizes a Markdown summary, and posts a richly formatted version to Slack
   — end-to-end, with no human in the loop.
 ---
 
-It's the first scenario built on the [external-tools platform](/developers/components/external-tools-platform):
-all twelve AWS calls and the Slack publish run through the new
-`tools/` registry, not the workspace file tools.
+It's the first scenario built on the
+[external-tools platform](/developers/components/external-tools-platform):
+all twelve AWS calls and the Slack publish run through the tool
+registry, not the workspace file tools.
 
 ## What it enables
 
 - One-command (or scheduled) AWS audit: compute footprint, storage
   hygiene, IAM key/MFA gaps, network exposure, cost movers, RDS
   posture, and CloudTrail coverage — all in a single run.
-- A consistent, narrated artifact (Markdown + Slack Block Kit) that
-  the team can read in 30 seconds instead of clicking through ten
-  console tabs.
+- A consistent, narrated artifact (Markdown + Slack) that the team can
+  read in 30 seconds instead of clicking through ten console tabs.
 - Graceful degradation when Cost Explorer or Compute Optimizer aren't
-  enabled: those tools surface `OptInRequired` as a clean
-  `ToolResult(ok=False)` and the loop continues with the remaining
-  signals.
+  enabled on the account: those checks report as unavailable and the
+  audit continues with the remaining signals.
 - A blueprint for future ops scenarios (Incident Response, Lead
   Qualifier, Vendor Audit) that need the same connector pattern.
 
-## What's changed
+## How a run works
 
-- New scenario YAML: `knowledge-hub/scenarios/aws_pulse_report.yaml`
-  with three levels — `collect` (tool_loop), `synthesize` (prompt),
-  `publish` (tool_loop) — wired by `intent_routes: [aws_pulse,
-  aws_audit, cloud_audit, aws_cost, aws_security]`.
-- Three new prompt builders in `worker/worker/graph/scenarios/prompts.py`:
-  `aws_pulse_collect`, `aws_pulse_synthesize`, `aws_pulse_publish`.
-  `aws_pulse_publish` interpolates the real UTC date into the Block Kit
-  header instruction; when it was a `<today's date>` placeholder the model
-  invented one (a 2026-09-03 run published "AWS Pulse — May 25, 2026").
-- CLI smoke runner: `python -m worker.scripts.run_scenario aws_pulse_report`.
-  Routes through the real `LlmProviders` + `EnvToolSecretProvider`;
-  prints the final Markdown body and a compact JSON tail.
+Three steps, in order: **collect** (the AWS tool loop), **synthesize**
+(the narrated summary), and **publish** (the Slack post). The report
+only fires on jobs that ask for it — it's off by default — and it's
+cost-bounded: at most $2.50 and ten minutes per run.
 
-## Impact scope
+## Setup
 
-- Pure addition. Doesn't touch the file-tool dispatch path; existing
-  `code_build` / `document_writing` / `quick_qa` runs are unaffected.
-- Requires per-tenant `aws_default` and `slack_bot` secrets seeded via
-  `python -m worker.scripts.seed_tool_secret` (see the
-  [external-tools-platform doc](/developers/components/external-tools-platform#tenant-secrets) for shape).
-  In EKS the correct shapes are:
-  - `aws_default` → `ref_kind=default_chain`. The resolver returns `{}`,
-    which `build_boto3_session` treats as "use the boto3 default
-    credential chain" — i.e. the worker pod's IRSA identity
-    (`cerebrum-worker-irsa`, which carries `ReadOnlyAccess`). Do **not**
-    use `ref_kind=env`: the worker Deployment injects no credential env
-    var, so every `aws_*` tool fails with `ToolSecretError` and the run
-    still reports `COMPLETED` with an empty report.
-  - `slack_bot` → `ref_kind=secrets_manager` pointing at
-    `cerebrum/connectors/slack` (`{token: xoxb-…, default_channel: C…}`).
-    `default_channel` is mandatory — the publish prompt deliberately omits
-    `channel` so the tool fills it in. The bot must also be **invited to
-    that channel**: for a private channel a non-member bot gets
-    `channel_not_found` (not `not_in_channel`), which reads like a bad
-    channel id but is a membership problem.
-  - The same Slack app now also serves inbound conversation
-    ([Slack Conversation](/capabilities/slack-conversation)), which needs additional
-    scopes. Adding scopes requires **reinstalling** the app — which rotates
-    nothing here, but does mean a scope change for one feature briefly
-    touches the token this one reads.
-- Defaults to off — only fires on jobs that carry one of the declared
-  intent routes.
-- Cost-bounded by the scenario budget (`max_cost_usd: 2.50`,
-  `max_duration_s: 600`).
-- Cost Explorer + Compute Optimizer enablement on the AWS account is
-  optional; gated tools degrade gracefully.
+- The AWS account is read through the account's own read-only identity
+  — no long-lived keys to manage.
+- Slack needs a bot token plus a default channel, and the bot must be
+  **invited to that channel**: for a private channel a non-member bot
+  surfaces "channel not found", which reads like a bad channel id but
+  is a membership problem.
+- The same Slack app also serves inbound conversation
+  ([Slack Conversation](/capabilities/slack-conversation)), which needs
+  additional scopes. Adding scopes requires **reinstalling** the app —
+  which rotates nothing here, but does mean a scope change for one
+  feature briefly touches the token this one reads.
 
-## Tests
+## Under the hood
 
-- Load test: every `prompt_ref` resolves to a registered builder;
-  every `intra_tools` name is in the registry; intent routes index
-  back to this scenario.
-- End-to-end integration test: drives the production
-  `ScenarioOrchestrator` with a scripted `FakeProviders` queue,
-  `botocore.stub.Stubber` for AWS, and `httpx.MockTransport` for
-  Slack. Covers the happy path and the OptInRequired graceful path.
-
-Run:
-
-```bash
-worker/.venv/bin/python -m pytest \
-  tests/test_scenario_aws_pulse_load.py \
-  tests/test_scenario_aws_pulse.py -v
-```
-
-Live smoke (manual, no Slack post — read-only AWS only):
-
-```bash
-RUN_LIVE=1 worker/.venv/bin/python -m pytest tests/test_aws_pulse_live.py -v
-```
+The scenario definition, tool wiring, and tenant secret shapes are on
+[External tools platform](/developers/components/external-tools-platform)
+and [Configuration](/developers/reference/configuration).

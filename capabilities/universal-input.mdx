@@ -1,223 +1,53 @@
 ---
 title: Universal Task Input
-description: '## What it enables'
+description: One Task input that accepts any free-text prompt and routes itself. You
+  no longer pick a category card to match your intent — you type, and Amos works out
+  whether the prompt is an AWS audit, a code build, a question, a research brief,
+  or...
 ---
 
-A single **Task** input that accepts any free-text prompt and
-auto-routes it to the right scenario based on content. The user no
-longer picks a category card to match their intent — they type, and
-the worker's intent_classifier scenario figures out whether the prompt
-is an AWS audit, a code build, a Q&A, a research brief, or something
-else. When the classifier isn't confident enough, it surfaces the top
-candidates as a button panel inside the task modal so the user can
-disambiguate with one click.
+## What it gives you
 
-Outcomes:
-- Faster prompt-to-result loop — no cognitive cost of guessing the
-  right card.
-- The scenario library grows without bloating the command widget. New
-  specialized scenarios (Vercel status, GitHub PR fix, Mintlify
-  publish, …) are reachable through the same Task input by adding an
-  `examples:` block to their YAML.
-- A reusable chain primitive — the classifier is the first user, but
-  future composite scenarios (incident_response → aws_pulse →
-  github_pr_fix) can chain through the same mechanism.
+- **A faster prompt-to-result loop.** No cognitive cost of guessing the right
+  card — type and go.
+- **A library that grows without cluttering the widget.** New specialized
+  scenarios (a status check, a PR fixer, a publisher, …) become reachable
+  through the same Task input, without a new button to hunt for. The old
+  temporary AWS Pulse card is gone for this reason — that flow is still
+  there, just ask for it.
+- **One click when Amos isn't sure.** When the routing isn't confident
+  enough, the top candidates appear as a button panel in the task modal, and
+  one click picks the right flow. The panel is the same one every Amos
+  question uses (see
+  [Universal User-Feedback System](/capabilities/user-feedback-system)).
+- **A useful answer even on a miss.** If the routing can't decide at all, the
+  prompt falls through to a straightforward question-and-answer flow rather
+  than failing.
 
-## What's changed
+## Follow-ups are routed on their own
 
-### Backend
+Every prompt is classified on its own content, not on the first prompt of the
+conversation. A single workflow can therefore mix kinds freely — *build a
+project → ask a question about it → request a security review → keep coding* —
+and a coding follow-up still targets the same repo, because the project
+binding survives routing.
 
-- `worker/worker/graph/scenarios/schemas.py` — `Scenario.examples:
-  list[str]` field added. Scenarios that opt in to the universal input
-  declare 3–5 representative prompts that characterize their domain.
-- `worker/worker/graph/scenarios/orchestrator.py` — three additions:
-  1. Tier-3 resolution rule: `metadata.kind == "task"` with no
-     explicit `scenario_id` / `intent_route` routes to
-     `intent_classifier`. Programmatic callers that set
-     `scenario_id` / `intent_route` are unaffected.
-  2. Chain primitive — `ScenarioResult.chained_intent_route` plus a
-     loop in `run()` capped at `MAX_CHAIN_DEPTH=3`. When a level's
-     `output_parsed.chosen_intent_route` is set, the orchestrator
-     re-dispatches the same job to the chosen scenario via
-     `metadata.scenario_id` (tier-1 explicit pin).
-  3. Classifier-failure safety net — when the classifier itself aborts
-     or returns no usable route, the orchestrator chains to `quick_qa`
-     so the user gets a useful response rather than a routing fault.
-- `worker/worker/graph/scenarios/runners.py` — JSON response levels
-  auto-populate `level.output_parsed`; the runner promotes
-  `chosen_intent_route` from a level's parsed output to top-level state
-  so the orchestrator's chain primitive picks it up.
-- `knowledge-hub/scenarios/intent_classifier.yaml` — the new meta
-  scenario. Two prompt levels: `classify` (free-tier JSON classifier
-  call with a schema verifier) and `disambiguate` (low-confidence
-  fallback that asks the user via `ask_user` with an enum schema).
-  Gate threshold: `level.classify.output_parsed.confidence >= 0.7`.
-- `worker/worker/graph/scenarios/prompts.py` — two new builders:
-  `intent_classifier_route` (synthesizes the registry into a routing
-  prompt) and `intent_classifier_disambiguate` (emits the ask_user
-  envelope + final JSON).
-- All user-facing scenarios (`aws_pulse_report`, `code_build`,
-  `document_writing`, `quick_qa`, `research_brief`, `security_review`)
-  backfilled with `examples:` blocks. Admin-only scenarios
-  (`code_build_strict`, `parallel_review_demo`) intentionally omit
-  examples so they stay out of the classifier catalog.
-- `quick_qa.yaml` — `intent_routes:` shrank from `[task, qa]` to
-  `[qa]`. The `task` route is reserved for the tier-3 classifier rule;
-  power users who want quick_qa directly should set
-  `scenario_id=quick_qa` or `intent_route=qa`.
+One boundary worth knowing: this routes *follow-ups*, not project
+origination. Starting a repo-backed project remains the job of the dedicated
+**project** command, which collects the structured fields (repo, branch, deploy
+target) that a mid-workflow prompt doesn't. A "start coding" follow-up on a
+plain conversation routes to the coding flow, but without a repo attached.
 
-### Frontend
+## You can say it instead of typing it
 
-- `apps/frontend/components/layout/footer/ask-user-enum-panel.tsx` —
-  new component. Detects enum-shaped `ask_user` schemas (`{type:
-  object, properties: {answer: {enum: [...], x-labels: {...}}}}`) and
-  renders one button per option. Click sends the chosen value via the
-  existing resume path. (Update 2026-06-03: this disambiguation panel is
-  now rendered by the `UniversalFeedbackPanel` via the `x-feedback`
-  contract — `intent_classifier_disambiguate` dual-emits both shapes. See
-  the [Universal User-Feedback System](/capabilities/user-feedback-system).)
-- `apps/frontend/components/workflow/timeline/event-timeline.tsx` —
-  the existing `ClarificationPrompt` now dispatches to
-  `AskUserEnumPanel` for enum schemas and falls back to the textarea
-  otherwise.
-- `apps/frontend/components/layout/footer/command-widget.tsx` — the
-  **AWS Pulse** card was removed (it was a temporary workaround
-  introduced before the classifier landed). The **Task** card's
-  description now reads "Free-text prompt; Amos routes it to the
-  right scenario automatically".
+The Task input is also the voice path. Hold the orb (or <kbd>Space</kbd>) and
+speak — anything that isn't a navigation command becomes a task and is routed
+exactly like typed text. When Amos needs to disambiguate, it reads the
+question aloud and your spoken answer snaps to the nearest offered option.
+See [Voice Control](/capabilities/voice-control).
 
-### Follow-up prompts are classified per-prompt (2026-06-05)
+## Under the hood
 
-The classifier originally only ran for the *first* prompt of a workflow.
-Follow-up prompts appended to a workflow that was **seeded by the
-`project` command** inherited that seed's `metadata.intent_route="project"`
-(and `kind="project"`) via `merge_workflow_metadata`, so the worker matched
-the tier-2 `intent_route` rule and pinned **every** follow-up to
-`code_build` — running the full paid L1→L4 pipeline even for a pure
-question. The tier-3 classifier path was never reached.
-
-- `mother-ai/src/routes.rs` — new `reset_routing_keys_for_append` helper,
-  applied in `append_prompt` (both the Postgres and no-Postgres branches).
-  Before queuing an appended prompt it drops the inherited `intent_route`
-  and `scenario_id` and forces `metadata.kind="task"`, so each follow-up is
-  re-classified on its own content. The workflow's **project binding** (the
-  nested `project` object, `project_slug`, model/effort hints) is preserved
-  untouched, so a follow-up the classifier routes back to `code_build` still
-  targets the right repo.
-
-Result: a single workflow now freely mixes scenarios across prompts — e.g.
-*build a project → ask a question about it (`quick_qa`) → request a security
-review (`security_review`) → keep coding (`code_build`, same repo)*. The
-`_dispatch_chain` re-dispatch carries the `project` object through every hop,
-so repo targeting survives classification.
-
-Because the `project` binding is preserved on follow-ups, a non-code scenario
-(`quick_qa`, `research_brief`, `security_review`, `document_writing`) now runs
-with a project workspace present. The thread runner gates its **legacy
-markdown-apply + build-verify pipeline** on whether the resolved scenario owns
-the workspace (`scenario_workspace_owned`, i.e. has a `tool_loop` level). A
-scenario that ran but does *not* own the workspace skips that pipeline entirely
-— so a Q&A follow-up no longer parses its answer as L4 file blocks or emits a
-spurious `build_verify_started` / no-files-repair. See
-`worker/worker/orchestration/thread_runner.py` (the `scenario_non_mutating`
-branch in `run()`). Genuine code scenarios use `tool_loop` and keep their own
-`l3_build_verify` verdict; legacy non-scenario runs (no `scenario_id` in state)
-are unchanged.
-
-Boundary: this re-routes *classification*, not project *origination*. A
-workflow seeded by a plain `task`/QA prompt has no `project` object, so a
-mid-workflow "start a coding project" follow-up routes to `code_build` but
-runs **without** a repo/branch/Vercel binding (`ProjectWorkspaceManager.prepare`
-returns `None`). Originating a repo-backed project remains the job of the
-dedicated `project` command, which collects the structured fields the append
-composer does not.
-
-### Plumbing cleanup
-
-- `mother-ai/src/routes.rs` — `aws_pulse` removed from `SUPPORTED` and
-  the enqueue match. The AWS Pulse scenario is still loaded by the
-  worker; it's now reachable only through the Task input + classifier.
-- `worker/worker/main.py` — `orchestration_kinds` shrank from `{task,
-  project, aws_pulse}` to `{task, project}`.
-- `worker/worker/models.py` — `aws_pulse` dropped from the
-  `JobEnvelope.kind` Literal.
-- `apps/frontend/lib/mother-ai-client.ts` — `aws_pulse` dropped from
-  `CommandIntentKind`.
-
-## Impact scope
-
-- **Backwards-compatible.** Jobs that arrive with an explicit
-  `metadata.scenario_id` or `metadata.intent_route` bypass the
-  classifier entirely. Programmatic callers (replay harness, admin
-  tooling, internal automation) stay unaffected.
-- **Off by default for non-task kinds.** The tier-3 rule only fires
-  for `metadata.kind == "task"`. The *first* `kind=project` prompt
-  keeps its route to `code_build`; **follow-up** prompts are reset to
-  `kind=task` on append and re-classified per-prompt (see "Follow-up
-  prompts are classified per-prompt" above). Other non-LLM kinds
-  (`rule`, `fact`, `planner`, `metric`) bypass the orchestrator entirely.
-- **One-time scenario library audit.** Every user-facing scenario
-  needs an `examples:` block to be discoverable through the universal
-  input. The bundled six were backfilled at ship; new scenarios should
-  add examples as part of the same PR that adds the scenario.
-- **Chain depth capped at 3.** The classifier counts as one hop, so
-  composable follow-ups (classifier → real scenario → optional
-  follow-on) have two more slots before the cap fires.
-
-### The Task input is now also a voice input (2026-08-21)
-
-Free text no longer has to be typed. The command widget's default surface is
-push-to-talk, and any utterance that doesn't match a local navigation command
-falls through to this exact path — `submitCommandIntent({kind: "task"})`, then
-`intent_classifier`. The classifier's low-confidence `disambiguate` level is
-what turns a vague spoken request into a two-way conversation: the question is
-read aloud, and the spoken answer is snapped to the nearest enum option before
-being handed to the existing `resume()`.
-
-Nothing in the classifier or the `ask_user` contract changed to allow this —
-voice is an input path onto the surfaces described above. The widget's own
-restructuring (it now portals out of the footer and has a hidden/expanded
-peek state) is covered in `Voice Control`, including why
-`components/layout/footer/command-widget.tsx` moved to
-`components/layout/command/`.
-
-## Tests
-
-- `tests/test_scenario_chain.py` — chain hop, MAX_CHAIN_DEPTH cap,
-  unknown-target fallback to quick_qa, metadata propagation, and
-  `test_chain_preserves_project_binding` (the `project` object survives
-  classification → chain so a code follow-up still targets the repo).
-- `tests/test_intent_classifier_load.py` — YAML parses, prompt refs
-  resolve, scenario compiles with `when:` expression, classifier
-  catalog has the right opt-in shape.
-- `tests/test_intent_classifier_scenario.py` — end-to-end with
-  scripted FakeProviders: high-confidence path (no disambiguate),
-  low-confidence path (mocked ask_user resume → chain), schema-fail
-  retry recovery.
-- `tests/test_scenario_dispatch.py` — `task` is no longer in the route
-  index, plus `test_appended_followup_with_project_binding_reclassifies`
-  (a `{kind:"task", project:{…}}` follow-up with no `intent_route`
-  resolves to `intent_classifier`, not `code_build`).
-- `mother-ai` (`cargo test`) — `reset_routing_keys_for_append` unit
-  tests: strips `intent_route`/`scenario_id`, forces `kind="task"`,
-  preserves `project`; composes with `merge_workflow_metadata`; passes
-  through non-object metadata.
-- `tests/test_thread_runner.py` —
-  `NonMutatingScenarioInProjectTests`: a non-workspace-owning scenario
-  (`quick_qa`) in a project-bound run emits no `build_verify_*` events,
-  parses no L4 file blocks, and skips the empty push; a workspace-owning
-  scenario (`code_build`) still takes the carry-through path.
-
-Run with:
-
-```bash
-/Users/azat/labs/amos/worker/.venv/bin/python -m pytest \
-    tests/test_scenario_chain.py \
-    tests/test_intent_classifier_load.py \
-    tests/test_intent_classifier_scenario.py \
-    tests/test_scenario_dispatch.py -v
-```
-
-Pre-existing failures unrelated to this change:
-`test_provider_registry.py::test_paid_provider_fallback_chain` and
-`test_security_review.py::SecurityReviewEndToEndTests::*`.
+How prompts are classified, how confident routing chains into the chosen
+scenario, and where the confidence threshold lives are described in
+[Scenarios runtime](/developers/components/scenarios-runtime).

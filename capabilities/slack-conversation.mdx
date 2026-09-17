@@ -1,307 +1,79 @@
 ---
 title: Slack Conversation
-description: '## What it enables'
+description: Slack is now a front end onto Amos, not a notification sink. Both Slack
+  integrations used to be one-way — reports and approval requests posted out, and
+  nothing came back. Now conversation goes both ways.
 ---
 
-Slack is now a **front end onto Amos**, not a notification sink.
+## What it enables
 
 - **Talk to the bot and get an answer.** DM the Amos app, or `@Amos` in any
   channel it is invited to, and the reply comes back in the thread — routed
-  through the same `intent_classifier` scenario the website's "Ask anything"
-  uses, so the answer is the answer, not a Slack-specific subset.
-- **Threads are conversations.** A Slack thread maps to one workflow, so a
-  follow-up reply continues with prior turns in context. The same conversation
-  is visible on the website, owned by the same person.
-- **Mid-run questions get answered where they were asked.** When a scenario
-  parks on a human gate, Amos asks in the thread — buttons where one click can
-  express the answer, a numbered list where it cannot — and either a click or a
-  typed reply resumes the job.
-- **Approval buttons work.** They previously did nothing at all, for four
-  independent reasons (see *What's changed*).
+  through the same routing the website's "Ask anything" uses, so the answer is
+  the answer, not a Slack-specific subset.
+- **Threads are conversations.** One Slack thread is one Amos conversation: a
+  follow-up reply continues with prior turns in context, and the same
+  conversation is visible on the website, owned by the same person.
+- **Mid-run questions get answered where they were asked.** When a job pauses
+  on a human gate, Amos asks in the thread — buttons where one click can
+  express the answer, a numbered list where it cannot — and either a click or
+  a typed reply resumes the job.
+- **Approval buttons work, both ways.** Approve or reject from Slack; when the
+  decision happens — from Slack *or* from the web inbox — the DM updates to say
+  what was decided and by whom, in plain language, and its buttons stop
+  looking live. You can also answer an approval **by typing in its thread**,
+  not only by clicking; if the web inbox and Slack race, the first decision
+  wins and the loser is told.
 
-Before this, both Slack integrations were one-way: the AWS Pulse report posted
-out, and the approval bot posted out. Nothing came back.
+## What Amos listens to
 
-## What's changed
+In a channel, Amos can see every message — that is how it follows a thread
+it is already talking in. Seeing and acting on are two different questions.
 
-### The buttons were dead — four causes
+**Amos acts on:** a DM, an `@mention`, and a reply inside a thread it already
+holds a conversation in. A top-level channel message is never a follow-up.
 
-1. **`SLACK_SIGNING_SECRET` was empty in the cluster.**
-   `verify_slack_signature` (`mother-ai/src/routes.rs`) rejects *every* request
-   when the secret is unset, which is the correct stance for an endpoint whose
-   only authentication is the signature — so `POST /v1/slack/interactions`, which
-   was otherwise fully implemented, 401'd on every click.
-2. **Slack ignores the interactivity response body for Block Kit
-   `block_actions`.** Returning `{"text": …}` is the legacy `interactive_message`
-   mechanism. The approval *was* being decided; the DM just never changed, which
-   reads as a dead button. Now replaced through `payload.response_url`
-   (`post_slack_response_url`), host-guarded and best-effort.
-3. **`close_slack_message` had zero call sites** since it was written, so a gate
-   decided in the web inbox left live-looking buttons in Slack forever. Wired
-   into the gate's resume edge (`_close_approver_dm` in
-   `worker/worker/graph/scenarios/runners.py`) — the one path every decision
-   crosses, whichever surface made it.
-4. **`_notify` in the acquisition runner called `notify_approval(approval=…)`,
-   which is not a parameter.** Every human-task DM raised `TypeError` into a
-   `LOGGER.debug`, so that class of approval never reached Slack. A
-   signature-bind test now pins the shape both call sites share.
+**Amos says nothing at all** for everything else, including when something is
+wrong. Two colleagues talking to each other in a thread Amos happens to be in
+will not draw a reply — it only speaks when it was spoken *to*.
 
-Also: `CEREBRUM_APP_BASE_URL` was read in two places and set nowhere, so the
-capability-live and vertical-ready DMs rendered without their buttons.
+It also never reacts to:
 
-### Inbound conversation
-
-| Surface | Where |
+| Skipped | Why |
 | --- | --- |
-| `POST /v1/slack/events` | `mother-ai/src/routes.rs` — `slack_events`, `triage_slack_event` |
-| `POST /v1/slack/interactions` | same file — now dispatches an enum: approval buttons *and* `ask_option:` question buttons |
-| Reply delivery | `worker/worker/orchestration/slack_reply.py` |
-| Markdown → mrkdwn | `worker/worker/runtime/tools/builtins/slack/mrkdwn.py` |
-| Completion hooks | `worker/worker/main.py` — `_maybe_slack_reply`, `_slack_reply_for_prompt`, `_make_slack_ask_sink` |
-| Thread + identity storage | `worker/worker/storage/postgres_repo.py` — `slack_threads`, `get_user_by_slack_id` |
+| Its own replies and every app post | the self-loop guard |
+| Slackbot posts (huddle notes, reminders) | Slackbot announces as a user, so it needs its own rule |
+| File attachments | a canvas, transcript or screenshot arrives as boilerplate text around a link, which Amos cannot act on — the underlying content still reaches it through knowledge ingest |
+| Edits and typo fixes | an edit would re-run a whole turn |
+| A bare `@Amos` with no message | a mention alone is not a prompt |
+| Authors outside the workspace | a Slack Connect channel can carry outsiders |
 
-New tables and columns:
+## One thing at a time
 
-- **`slack_threads`** — `primary key (channel, thread_ts)` → `workflow_id`,
-  `user_id`, `team_id`, `last_job_id`. A table rather than an index on
-  `workflow_runs.metadata` because the claim must be *atomic* (two messages in
-  one thread would otherwise each create a workflow and split the history) and
-  because `upsert_workflow_prompt_in_postgres` rewrites that metadata on every
-  append.
-- **`idx_user_slack_identities_slack_user`** — a partial, deliberately
-  **non-unique** index for the reverse lookup. The column is nullable,
-  `clear_slack_user_id` nulls it and the upsert keys on `user_id`, so duplicates
-  are already possible; a unique index would fail on existing data inside
-  `ensure_schema()`, whose failure mode is "no worker boots at all".
+- **One turn per thread at a time.** A second message while the first is
+  running is answered with "still working on your previous message" rather
+  than queued or interleaved.
+- **An ack, then the answer.** No live progress in Slack — the answer arrives
+  as a message when it is ready.
+- **No slash commands and no file uploads yet.** A shared file gets a spoken
+  refusal explaining that, not silence.
+- **Recent context only.** Amos carries the last few completed turns of a
+  thread, so a very long Slack conversation will feel slightly thinner than
+  the transcript looks — Amos never reads back through Slack history itself.
 
-### Credentials — one home, one thing to rotate
+## Who you are in Slack
 
-Everything the Slack app needs lives in **Secrets Manager at
-`cerebrum/connectors/slack`**, which is the same secret the worker already reads
-for approval DMs and the `slack_post_*` tools:
+A Slack message is matched to your **existing** Amos account by your
+workspace-verified email address. Amos only ever matches — it never creates an
+account on your behalf — and only for authors inside the configured workspace.
 
-```json
-{ "token": "xoxb-…", "signing_secret": "…", "default_channel": "C…" }
-```
+## Under the hood
 
-Terraform reads it (`data.aws_secretsmanager_secret_version.slack`) and projects
-`token` + `signing_secret` into `mother-ai-secrets`. The `slack_bot_token` /
-`slack_signing_secret` tfvars variables survive only as a fallback for an
-environment without Secrets Manager — copying the token into tfvars would
-otherwise create a second source of truth that silently drifts on rotation.
-
-Two values are **derived, not configured**. `slack_workspace()` in
-`mother-ai/src/routes.rs` calls `auth.test` once per process (lazily, cached in
-a `tokio::sync::OnceCell` so a transient outage at first contact costs one
-message rather than every message until a rollout) and gets back:
-
-- the **workspace id**, which is a property of the credential. Configuring it
-  separately only creates something that can drift, and it fails closed *and*
-  silently when it does — every message refused as "outside the allowed
-  workspace". `SLACK_TEAM_ID` remains an override.
-- the **bot's own user id**, which nothing else can supply and which is the
-  second half of the self-loop guard (`bot_id` is the first).
-
-The **signing secret is the only credential nothing can derive** — it exists
-only in the Slack app console. Everything inbound 401s until it is set.
-
-Also new: `CEREBRUM_APP_BASE_URL` on the worker (`app_base_url`).
-
-### When Amos speaks, and when it stays quiet
-
-In a channel, Amos hears everything — the bot has `channels:history` /
-`groups:history` for the ingest connector — so "should I act on this?" and
-"should I say something?" are two different questions.
-
-**Acts on:** a DM, an `@mention`, and an un-mentioned reply inside a thread it
-already holds a conversation in (looked up in `slack_threads`; a top-level
-channel message is never a follow-up).
-
-**Says nothing at all** for anything else, including when something is wrong.
-The distinction is `addressed` in `slack_events`: a DM or `@mention` is Amos
-being spoken *to*; an overheard channel reply is not. So an unknown actor, a
-thread owned by someone else, or a turn already in flight each produce an
-explanation only for the first kind. Two colleagues talking to each other in a
-thread Amos happens to be in used to draw "this thread belongs to someone
-else's conversation" on every message.
-
-**Never reaches the conversation path:**
-
-| Dropped | Why |
-| --- | --- |
-| `bot_id` present | its own replies, and every app post — the self-loop guard |
-| `user == "USLACKBOT"` | Slackbot posts as a **user**, so it carries no `bot_id`. This is how huddle transcripts ("AI huddle notes are ready…") got answered with an account-linking notice addressed to a robot. |
-| non-empty `files` | a canvas / transcript / screenshot is boilerplate text wrapped around a link, and Amos cannot act on the attachment. The content still reaches it — through the ingest connector, which fetches canvas bodies. |
-| any `subtype` | `message_changed` would re-run a whole turn on a typo fix |
-| `app_mention` in a DM | Slack delivers both that *and* `message.im`, with different `event_id`s |
-| author outside the workspace | `event.user_team`, not the envelope's `team_id` — those differ in a Slack Connect channel |
-| empty text after stripping mentions | "@Amos" alone is not a prompt |
-
-### Identity
-
-A Slack author becomes an Amos user by **workspace-verified email match**:
-`users.info` → `profile.email` → `"user"` where `banned is not true`. It only
-ever *matches* an existing account, never creates one, and the author's team
-(`event.user_team`, not the envelope's `team_id` — those differ in a Slack
-Connect channel) must be the configured workspace.
-
-This is a deliberate exception to `approval_notify`'s "a user fact comes from
-the user" rule, and it is recorded in that module's docstring. A row written
-`source='slack_profile'` was never asked for, and `resolve_recipient` does not
-filter on `source` — so such a user also becomes reachable for outbound
-approval DMs.
-
-### The resume-shape contract
-
-There are four resume value shapes (mirroring the frontend's
-`pickAskUserRenderer`) and sending the wrong one **fails silently**: a gate with
-no `x-feedback` descriptor reads `value["approved"]`, so answering it with
-`{"selected": [], "text": "yes go ahead"}` evaluates to `False`, rejects what
-the human just approved, and registers an escalation failure.
-
-Only the worker holds the schema, so the worker decides the shape and writes it
-into `cerebrum:slack:await:{channel}:{thread_ts}` as
-`{job_id, interrupt_id, shape, options, approval_id?}`. mother-ai fills the
-envelope from that rather than re-deriving it.
-
-`approval_id` is present when the gate also wrote an `approvals` row — which is
-exactly the case where two surfaces can see the same question. Then the resume
-goes through that row's atomic `where status = 'pending'` claim instead of a
-bare resume, so the web inbox and the Slack thread racing to answer produce one
-winner rather than two resumes of the same job.
-
-## Impact scope
-
-**Backwards-compatible.** Nothing changes for a job that did not arrive from
-Slack: `resolve_reply_channel` returns `None` and no Slack code runs.
-
-**Off by default.** Inbound conversation needs `signing_secret` in the Slack
-secret. Unset means inbound *refuses* rather than degrades: the signature is the
-only authentication those endpoints have, so trusting an unsigned request would
-be worse than answering nothing.
-
-**Changed for everyone (not just Slack):**
-
-- Approval DMs now visibly close when decided, from either surface — and say
-  *what* was decided. They used to render the internal option id and a raw
-  Better Auth user id (`Decided (quick_qa) by vOFhHe2f…`), which is unreadable
-  and prompted a human to reply in the thread asking what it meant. The option
-  label and the requester are both on the row; `decided_outcome` /
-  `decided_attribution` use them.
-- A DM'd approval can be answered **by typing in its thread**, not only by
-  clicking. `notify_approval` parks the thread on the gate, carrying the
-  `approval_id` so the resume goes through that row's atomic
-  `where status = 'pending'` claim — the bare resume path cannot make two
-  surfaces racing on one gate produce a single winner.
-- `approvals.workflow_id` is populated. It read `metadata["workflow_id"]`,
-  which nothing sets (the id travels on the job envelope and reaches the runner
-  via the bus), so **every row ever written had NULL** and no approval could be
-  joined to the workflow whose gate it was.
-- `human_action` approval DMs send at all for the first time.
-- The four pre-graph gates coerce an invalid resume value instead of raising,
-  and `_handle_resume_envelope`'s dispatch is wrapped. Previously one malformed
-  resume value propagated out of the main `while True` and **exited the worker
-  process**; it now fails one job and leaves a terminal status behind.
-- `resume_parked_job` takes an `interrupt_id`. The existing approval caller
-  passes `None` (unchanged behaviour — an approval row *is* its gate).
-
-**Deliberate limits:**
-
-- **No per-user budget enforcement on the Slack path.** mother-ai has one static
-  api key; the 402 lives in the Next BFF. Ownership *is* enforced, because that
-  is a data-leak boundary rather than a spend one.
-- One turn at a time per thread. A second message while the first runs is
-  answered with "still working on your previous message" — prompts default to
-  `parallelizable`, and `sequential_only` is worse (the deferral path re-enqueues
-  with no backoff and fails the job past 25 deferrals).
-- No slash command, no attachments (`file_share` gets a spoken refusal, not
-  silence), no multi-select checkboxes, no live progress — an ack, then the
-  answer.
-- Thread history is the worker's usual window: the last 6 completed turns,
-  truncated. A long Slack thread will feel slightly thinner than the transcript
-  looks. Amos also never reads Slack thread history directly.
-
-## Tests
-
-```bash
-/Users/azat/labs/cerebrum/worker/.venv/bin/python -m pytest tests/ -v
-cd mother-ai && cargo test
-```
-
-- **`tests/test_slack_reply.py`** (52) — mrkdwn conversion (escaping, fences,
-  the bold-before-italic ordering trap), chunking (never inside a fence, an
-  unbreakable line hard-cut rather than dropped), reply delivery and thread
-  release, the four resume shapes, question rendering and Slack's limits, the
-  `ask_user` bus sink, pre-graph coercion.
-- **`tests/test_approvals.py`** (47) — adds the `notify_approval` signature-bind
-  regression and the DM-close path.
-- **`tests/test_slack_threads_postgres.py`** (13) — live Postgres. Includes an
-  8-way concurrent `claim_slack_thread` proving exactly one winner, the
-  duplicate-`slack_user_id` tie-break, and an `EXPLAIN` check that the partial
-  index covers the lookup. Skipped unless `TEST_POSTGRES_DSN` is set; see the
-  module docstring for the throwaway-server recipe.
-- **`mother-ai` `cargo test`** (97) — every triage trapdoor (DM/mention double
-  delivery, `bot_id` self-loop, `message_changed` re-running a turn,
-  `file_share` named rather than dropped, author team vs envelope team,
-  empty-after-stripping, `event_id` read off the outer envelope), the
-  `SlackAction` enum, the resume-value mapping per shape, and the
-  `response_url` host guard.
-- **`tests/conftest.py`** — a rail that fails any test reaching real Slack.
-  Guarded at `httpx.HTTPTransport`, the only boundary that is exactly the
-  network, so `mock_http_client`'s `MockTransport` passes through. Needed
-  because a real bot token resolves from Secrets Manager on a dev machine —
-  writing these tests posted to the live workspace once.
-
-**Pre-existing failures, not this change:** 9 in `test_taxonomy_store.py`,
-`test_vertical_offer_gate.py` and `test_open_world_boot.py`. Verified identical
-with this work stashed.
-
-## Setup checklist
-
-Everything here is manual because none of it can be derived: a signing secret
-and a scope grant exist only in the Slack app console.
-
-1. **Store the signing secret** (Slack app → Basic Information) next to the
-   token, so there is still one credential home:
-
-   ```bash
-   aws secretsmanager get-secret-value --region ap-east-1 \
-     --secret-id cerebrum/connectors/slack --query SecretString --output text \
-     | jq '. + {signing_secret: "PASTE"}' \
-     | xargs -0 aws secretsmanager put-secret-value --region ap-east-1 \
-         --secret-id cerebrum/connectors/slack --secret-string
-   ```
-
-2. **Scopes:** `app_mentions:read`, `chat:write`, `im:history`, `im:write`,
-   `users:read`, `users:read.email`. Verify what is actually granted rather
-   than what the console page appears to show — the header is authoritative:
-
-   ```bash
-   curl -sD - -o /dev/null -H "Authorization: Bearer $TOKEN" \
-     https://slack.com/api/auth.test | grep -i x-oauth-scopes
-   ```
-
-   `users:read.email` is only needed for a user with no
-   `user_slack_identities` row yet; an existing mapping resolves from the DB.
-3. **App Home** → enable the Messages Tab *and* "Allow users to send messages",
-   or the DM composer stays disabled and no `message.im` event can ever fire.
-4. **Event Subscriptions** → Request URL `https://<ingress_host>/v1/slack/events`;
-   subscribe to `app_mention` and `message.im`. The URL only verifies *after*
-   the signing secret is live.
-5. **Interactivity** → Request URL `https://<ingress_host>/v1/slack/interactions`.
-6. **Reinstall the app** — scope changes require it.
-7. `terraform apply` (picks the credentials out of Secrets Manager) and rebuild
-   the worker + mother-ai images.
-
-### Diagnosing silence
-
-mother-ai sets no `RUST_LOG`, so its `TraceLayer` logs nothing and an inbound
-request leaves no trace at all. Before testing:
-
-```bash
-kubectl set env -n cerebrum deploy/mother-ai RUST_LOG=mother_ai=debug,info
-```
-
-The triage ignore-reasons are `debug`-level and name the exact rule that dropped
-a message (`author is outside the allowed workspace`, `app_mention duplicating a
-DM`, `message subtype`…). Reverted by the next `terraform apply`.
+- [HTTP API & event stream](/developers/reference/api-and-events) — the Slack
+  event and interaction endpoints, and the question/answer contract the
+  in-thread gates ride on.
+- [Data model](/developers/reference/data-model) — how a thread is claimed to a
+  conversation and how a Slack identity maps to a user.
+- [Configuration](/developers/reference/configuration) — the Slack credentials a
+  deployment needs before inbound conversation turns on; without them inbound
+  refuses rather than degrades.

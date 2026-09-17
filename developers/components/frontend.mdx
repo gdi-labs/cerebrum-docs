@@ -1,31 +1,46 @@
 ---
 title: Frontend
-description: Next.js 16 / React 19 dashboard. Hosted on Vercel.
+description: 'Next.js / React dashboard, hosted on Vercel. It renders the whole product
+  surface — submitting work, watching runs live, approvals, projects, initiatives,
+  the knowledge atlas, and administration. Architecture in one line: the frontend
+  ho...'
 ---
 
 ## Surfaces
 
-- `/` — dashboard.
-- `/workflows` — workflow editor and runner (graph + prompt composer + panels).
-- `/agents` — agent activity and metrics.
-- `/atlas` — 3D knowledge graph.
-- `/multi` — command-centre and multi-job view.
-- `/knowledge` — admin edit surface for the knowledge hub.
+Authenticated routes (behind the session gate):
+
+| Route | Purpose |
+| --- | --- |
+| `/new` | Submission composer — the goal, task type, and the compute-budget choice (Free / Cost-optimized / Frontier) via the tier modal. |
+| `/workflows` | Workflow editor and runner: graph canvas, prompt composer, live panels. |
+| `/work` | Typed work items — planned work and their roadmaps. |
+| `/approvals` | Every parked gate with its durable approval row; decisions here resume runs. |
+| `/projects` | The per-project consoles (see [Project Console](/capabilities/project-console)). |
+| `/initiatives` | Long-running initiatives. |
+| `/capabilities` | Acquired capabilities and their ledger. |
+| `/agents` | Agent activity and metrics; the agent workbench. |
+| `/atlas` | The 3D knowledge graph (the old `/knowledge` route redirects here). |
+| `/multi` | Command-centre and multi-job view. |
+| `/admin` | Admin section: users, roles, budgets, spend. |
+| `/login` | Sign-in — renders outside the authenticated chrome. |
 
 ## What it owns
 
-- SSE consumption of Mother AI's per-job event stream and rendering of backlog plus live events.
-- Project lifecycle UI — create, list, link to workspaces.
-- Workflow editor and runner.
-- 3D knowledge atlas.
-- Command-centre and telemetry views.
+- **Live run rendering.** SSE consumption of Mother AI's per-job event stream (`useJobStream` replays the durable backlog before joining the live channel, so a reconnecting client never misses an event). The scenario canvas derives graph, step list, verifier rows, gate decisions, and the budget ticker from the event stream alone — no polling. Step nodes wear the serving model's brand mark; `model_fallback` corrects a step's model live; `deterministic` steps render as "composed in code". The event contract is in [HTTP API & event stream](/developers/reference/api-and-events).
+- **Model naming.** `modelDisplayName`/`modelBrand` read the served catalog — a model added to the catalog names itself correctly with no frontend release.
+- **Auth integration.** Optimistic cookie gate in middleware, server-side guards per page/route, and a single-round-trip `requireAccess()` preflight against the [Auth service](/developers/components/auth) for identity + ownership + budget. The frontend itself holds no auth secrets — see [Auth](/developers/components/auth) for the boundary.
+- **Project lifecycle UI** — projects, consoles, rename/delete.
+- **Approvals & human input** — the universal feedback panel renders any question shape (single/multi-select, free text) with visual options; approvals are decidable inline or via the approvals page.
+- **3D knowledge atlas** and knowledge search; QA answer panels cite retrieved sources.
+- **Command-centre and telemetry views** — cost panels and run history via the telemetry API.
 
 ## Invariants
 
-- The frontend is **stateless beyond local UI state**. Every long-lived resource — jobs, projects, workflows, hub edits — lives in Postgres or Qdrant via Mother AI.
-- SSE is the primary live channel. The `useJobStream` hook replays the durable backlog before joining the pubsub stream so a reconnecting client never misses events.
-- React-Query owns server-state caching.
+- **Stateless beyond local UI state.** Every long-lived resource — jobs, projects, workflows, hub edits — lives in Postgres or Qdrant via Mother AI.
+- **The BFF is the trust boundary.** The browser never talks to Mother AI directly; every server route forwards the session and resolves identity/ownership/budget first. Auth failures degrade differently on purpose: pages *look logged out*, API routes fail loudly.
+- **SSE is the primary live channel**; React-Query owns server-state caching.
 
 ## Stack
 
-Tailwind, Radix primitives, shadcn-style components. The 3D atlas uses `@react-three/fiber`, `@react-three/drei`, and `d3-force-3d`.
+Tailwind, Radix primitives, shadcn-style components. The 3D atlas uses `@react-three/fiber`, `@react-three/drei`, and `d3-force-3d`. Internationalization via `next-intl` (locale-prefixed routes).

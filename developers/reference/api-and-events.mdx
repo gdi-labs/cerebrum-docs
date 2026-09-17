@@ -1,0 +1,115 @@
+---
+title: HTTP API & event stream
+description: 'The wire surface of the platform: the HTTP endpoints Mother AI serves
+  and the typed event stream every run emits. Mother AI is the single ingress — the
+  queue-first invariant means a submission becomes a Redis job before any execution,
+  an...'
+---
+
+Authentication is by Authorization-header API token validated against team policy (per-user and per-org rate limits are enforced at ingress, and prompt text is redacted for obvious secrets/PII before queueing). The web frontend reaches these endpoints through its own BFF, which resolves the user's session and budget/ownership checks against the [Auth service](/developers/components/auth) — see [Mother AI](/developers/components/mother-ai) for the service's own story.
+
+## Endpoints
+
+Grouped by area; paths relative to the Mother AI origin.
+
+### Jobs
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/chat` | Submit a prompt. Returns `job_id`. |
+| `GET` | `/v1/jobs/:id` | Current job status. |
+| `GET` | `/v1/jobs/:id/stream` | SSE event stream — see the contract below. |
+| `POST` | `/v1/jobs/:id/resume` | Resume a job paused on an `ask_user` interrupt (`Command(resume=…)` payload). |
+| `POST` | `/v1/jobs/:id/cancel` | User Stop. Sets a Redis cancel flag, marks the job terminal `cancelled`, and best-effort updates Postgres so the UI unsticks immediately. |
+
+### Workflows & prompts
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` / `POST` | `/v1/workflows` | List workflows (filterable, e.g. by `project_slug`); create a workflow + first prompt thread. |
+| `GET` | `/v1/workflows/:id` | Durable workflow status (Postgres-first, Redis fallback). |
+| `GET` / `POST` | `/v1/workflows/:id/prompts` | Prompt-thread list; append a prompt to a running workflow. |
+| `POST` | `/v1/workflows/:id/hide` / `…/unhide` | Hide/unhide a workflow. Hidden rows stay resolvable by direct lookup so deep links keep working. Currently any valid API token may call these — there is no admin-role gate yet. |
+| `POST` | `/v1/workflows/:id/agents`, `…/edges`, `…/edges/delete`, `…/edge-prompt` | Edit the workflow graph. |
+| `GET` | `/v1/workflows/:id/run-graph` | Archived run graph for a finished workflow. |
+
+### Projects, capabilities, work
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` / `POST` | `/v1/projects` | List projects; create one. |
+| `GET` | `/v1/projects/:slug` | Single project by collision-free slug. |
+| `POST` | `/v1/capabilities/plan` | Plan a capability (returns a roadmap job). |
+| `GET` | `/v1/capabilities`, `/v1/capabilities/ledger`, `/v1/capabilities/roadmaps/:id` | Capability registry, activation ledger, roadmap status. |
+| `GET` / `POST` | `/v1/verticals` | List known verticals; start vertical discovery. |
+| `GET` | `/v1/work-types`, `/v1/work-items/:slug/plan` | Work-type catalog; work-item plan. |
+| `POST` | `/v1/work-items/:slug/replan` | Replan a work item. |
+
+### Approvals
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/v1/approvals` | List pending/decided approvals (drives the Action Dock and `/approvals`). |
+| `GET` | `/v1/approvals/:id` | One approval. |
+| `POST` | `/v1/approvals/:id/decide` | Decide an approval — the same path Slack's buttons take. |
+
+### Models & catalog
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/v1/models` | The merged catalog: every provider/model with capability, cost tier, price, and **live free-tier quota** from the same Redis keys the dispatch ledger uses. `configured`/`allowed` flags exist to answer "why can't I use X" without log archaeology. |
+
+### Slack, knowledge, misc
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/slack/events`, `/v1/slack/interactions` | Slack event subscriptions and button/interaction callbacks (approvals, mid-run questions). |
+| `GET` | `/v1/atlas/domains`, `/v1/atlas/scope`, `/v1/atlas/node/:kh_id` | Knowledge-atlas graph data. |
+| `POST` / `GET` | `/v1/kb/edit`, `/v1/kb/file`, `/v1/kb/doc/:kh_id`, `/v1/kb/query` | Knowledge-hub read/edit surface (the KB MCP server sits on `kb/query`). |
+| `GET` / `POST` | `/v1/designs`, `/v1/initiatives`, `/v1/command/intents`, `/v1/stats`, `/healthz` | Design catalog, initiatives, non-LLM intent routing, system stats, liveness. |
+
+## The SSE stream
+
+`GET /v1/jobs/:id/stream` replays the **durable backlog** (the job's event list in Redis) before joining the live pub/sub channel, and stays open until the job finishes or errors. The invariant: a reconnecting client never misses an event — replay first, then live, with monotonic `sequence` numbers to detect gaps.
+
+## The AgentEvent envelope
+
+Every event is JSON with a discriminated `kind`:
+
+```json
+{
+  "schema_version": "1",
+  "job_id": "…", "workflow_id": "…", "prompt_id": "…",
+  "agent_role": "L4.executor",
+  "sequence": 42,
+  "occurred_at": "2026-09-17T12:00:00Z",
+  "kind": "level_finished",
+  "payload": { }
+}
+```
+
+Consumers must tolerate unknown kinds (render a generic timeline row) — the catalog grows. Canonical definitions: `worker/worker/runtime/agent_messages.py` (Python) mirrored by `apps/frontend/lib/types/agent-event.ts` (TypeScript).
+
+### Kind catalog
+
+| Group | Kinds |
+| --- | --- |
+| Node + level lifecycle | `node_started`, `node_finished`, `level_started`, `level_finished`, `scenario_started`, `scenario_finished`, `scenario_chained` |
+| Agent activity | `thinking`, `tool_call`, `tool_result`, `prompt_sent`, `agent_handoff`, `heartbeat`, `ui_action` |
+| Routing | `routing_decision`, `provider_fallback`, `model_fallback` |
+| Verification + gates | `verifier_started`, `verifier_finished`, `gate_decision`, `scope_checked`, `scope_confirmed`, `clarify_checked`, `clarify_confirmed`, `solutions_resolved` |
+| Budget | `budget_consumed`, `budget_exceeded` |
+| Artifacts | `final`, `error`, `file_created`, `vercel_deployed`, `vercel_deploy_failed`, `build_verify_started`, `build_verify_passed`, `build_verify_failed` |
+| Human input | `ask_user`, `approval_requested`, `human_task_assigned` |
+| Skill acquisition | `product_build_started`, `capability_acquisition_blocked`, `vertical_discovery_started`, `vertical_planning_resumed`, `acquisition_unit_started`, `acquisition_unit_verified`, `acquisition_unit_failed`, `capability_acquired` |
+| Pre-graph confirmations | `template_selected`, `template_scaffolded`, `design_selected`, `design_applied` |
+
+### Payload contracts worth knowing
+
+- **`routing_decision`** — emitted **per level** during scenario runs (`level_id`, `provider`, `model`, `tier`, `model_candidates`). `model` is the *intended* model and may be `""` (nothing pinned). The legacy job-level variant from the pre-scenario orchestrator carries no `level_id`; consumers must not attribute it to a level.
+- **`level_finished`** — `ok`, `attempt`, `duration_ms`, `cost_usd`, `output_preview`, optional `verdict`. Its optional `provider`/`model` name the model that **actually** answered, and are present only for levels that made an LLM call. **Absence is the contract**: gates, verifiers, and aggregators omit both, which is what lets the canvas keep a role glyph instead of painting a brand mark on a level that never talked to a provider. Do not default the field. A `prompt` level that was composed in code sets `deterministic: true` — a third state, distinct from both "model present" and a gate's silent absence.
+- **`model_fallback`** — dispatch walked the band and a later candidate answered (`from_model`, `to_model`, `to_provider`, `reason`). It corrects the intended model a `routing_decision` already reported for the same level, live, instead of waiting for `level_finished`.
+- **`provider_fallback`** — the coarser, older signal: a level rerouted from paid to free transport entirely.
+- **`ask_user` vs `approval_requested`** — `ask_user` drives the inline question panel on the live stream and pauses the graph on an interrupt (resumable via `POST /v1/jobs/:id/resume`). `approval_requested` means a durable `approvals` row exists, so the decision can also land from Slack or the approvals page; both are addressable by `call_id`/`approval_id`.
+- **`scenario_chained`** — ScenarioOrchestrator re-dispatched the same job to a follow-up scenario (e.g. intent classification → QA); the next `scenario_started` arrives right after.
+- **`final`** — terminal, with `agent_message`, `summary`, and cumulative `created_files`; `error` is the other terminal kind and carries `retryable`.

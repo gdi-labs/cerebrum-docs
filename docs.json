@@ -68,6 +68,7 @@
             "pages": [
               "developers/components/mother-ai",
               "developers/components/worker",
+              "developers/components/auth",
               "developers/components/ingest",
               "developers/components/frontend",
               "developers/components/mcp-amos-kb",
@@ -82,6 +83,15 @@
               "developers/components/notion-ingest",
               "developers/components/qa-answer-panel",
               "developers/components/scenarios-runtime"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "developers/reference/api-and-events",
+              "developers/reference/model-routing",
+              "developers/reference/data-model",
+              "developers/reference/configuration"
             ]
           }
         ]

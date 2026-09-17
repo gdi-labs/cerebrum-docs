@@ -24,14 +24,20 @@ expensive model can meet them, the work goes there.
 ## Ten providers, one contract
 
 Claude, OpenAI, DeepSeek, GLM (Zhipu), Kimi (Moonshot), MiniMax, plus the Groq
-and OpenRouter routers. Adding one is a row in
-`config/model_catalog.yaml` — ten of the eleven speak the same HTTP shape, so a
-new vendor usually needs no code at all.
+and OpenRouter routers. Adding one is a configuration row, not a code change —
+ten of the eleven speak the same wire format, so a new vendor usually needs no
+code at all. (Developers: [Model routing](/developers/reference/model-routing).)
 
 Cost tiers are `free → cheap → mid → frontier`, and cheap is roughly a tenth of
 frontier for reasoning-heavy work. That is where the saving comes from: bulk
 implementation and reasoning prefer cheap, and only the steps that need a
 frontier model get one.
+
+Choosing a tier is choosing a *band*, not a model. The frontier band holds
+models from **three vendors** — deliberately, so the band has somewhere to go
+when one of them is down (see the fallback section below). Planning and
+building ride the band's strongest model; the band's weaker members are the
+escape hatch, not a downgrade Amos reaches for willingly.
 
 ## How hard to think, portably
 
@@ -74,6 +80,22 @@ the right response differs:
 - **A missing capability** is refused before the call, naming the model and the
   feature it lacks, instead of arriving as a provider 400 or a confident answer
   about an attachment the model never received.
+
+And when the failure is none of those — the provider is healthy, funded and
+capable, the model is simply unavailable right now — the tier's own band is the
+fallback. Dispatch walks its members strongest-first: under the frontier budget
+a failed request against the strongest model is retried against the band's next
+model, then the band's other vendors, before any provider default or a level
+failure. The walk crosses providers as it descends, a refused credential skips
+the rest of that vendor's candidates in one step, and the step's UI badge names
+the model that actually answered. One vendor's bad afternoon costs a hop
+instead of the run.
+
+A tool loop walks the same band only until its first successful turn; after
+that the conversation's tool-call history is vendor-shaped, and switching
+models mid-conversation would corrupt it. (The shipped bands, the walk's exact
+ordering, and its configuration are on
+[Model routing](/developers/reference/model-routing).)
 
 ## Per-call cost tracking
 

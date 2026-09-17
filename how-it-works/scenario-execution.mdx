@@ -1,438 +1,92 @@
 ---
 title: Scenario execution
-description: 'This document walks a single job through the scenario runtime end-to-end:
-  from the worker receiving a payload to the terminal ScenarioResult and the event
-  stream that lands on the SSE channel. It''s the companion to the API reference in
-  S...'
+description: Every goal you submit runs as a scenario — a named, versioned flow of
+  steps with its own budget, verifiers, and decision gates. This page walks one run
+  from submission to result, as you see it.
 ---
 
-## 1. Worker dispatch
+## Which flow runs
 
-The legacy `WorkerOrchestrator` is unchanged: it still routes free vs. paid
-through `routing.py` and either short-circuits to `free_model_node` or
-delegates to a single `HierarchyOrchestrator` instance. The change is
-that the field formerly named `hierarchy` is now a `ScenarioOrchestrator`
-with the same public `run(payload, routing_decision, event_bus) ->
-ScenarioResult` signature.
+Amos picks the flow for you, in order of precedence:
 
-## 2. Orchestrator construction (per-process)
+1. **Explicit choice** — a pinned scenario id (used by replays and admin tools).
+2. **What you asked for** — the task type from the composer maps to a flow:
+   a project build → `code_build`, a document → `document_writing`, a question
+   → `quick_qa`, research → `research_brief`, a security review →
+   `security_review`.
+3. **The default** — a code build.
 
-When the worker boots:
+The run's timeline records why a flow was picked, so "why did it do that?" is
+answerable. One flow can also chain into another mid-run — an intent
+classification flowing into a question-answering flow, say — and the timeline
+draws the link.
 
-1. `ScenarioOrchestrator.__post_init__` runs once.
-2. `register_with_existing_verifier(default_registry, build_verifier)`
-   wires the worker's pre-constructed `BuildVerifier` under the name
-   `build`.
-3. `register_llm_judge(default_registry, providers)` injects the worker's
-   `LlmProviders` instance into a fresh `LLMJudgeVerifier` factory.
-4. `ScenarioLoader(scenarios_root).load_all()` reads every
-   `knowledge-hub/scenarios/*.yaml`, validates each against the Pydantic
-   schemas, and compiles every `edge.when` clause through `expr.py`. Any
-   error fails fast with the source filename in the message.
-5. Per-tenant overrides (when the worker has been configured with a
-   `tenant_id` + `TenantOverrideProvider`) deep-merge over the base
-   scenarios.
-6. `PromptLevelRunner`, `VerifierLevelRunner`, `FanOutLevelRunner`,
-   `HumanApprovalLevelRunner` are constructed and registered with
-   `ScenarioExecutor` under their respective `kind` keys.
-7. `ScenarioCompiler(scenario, dispatcher=executor).compile()` runs once for
-   **every** loaded scenario; the compiled graphs land in
-   ``_compiled_by_id`` keyed by scenario id. ``run()`` then picks one per
-   job — see [§ 3a](#3a-per-job-scenario-selection) below. Topology rules
-   (applied per scenario):
-   - one node per level;
-   - edges with `when: None` become unconditional `add_edge`s;
-   - edges with a `when` clause are grouped per source and emitted as
-     `add_conditional_edges` with a router function that evaluates the
-     compiled DSL expressions in priority order and emits a
-     `gate_decision` event when a branch fires;
-   - levels with no outgoing edges implicitly route to `END`.
+## The steps
 
-## 3a. Per-job scenario selection
+A flow is a graph of steps (levels), not a straight line. Each step has a role
+on the team — a lead that frames the work, an architect that plans, a builder
+that writes, a reviewer that judges — and a declared kind:
 
-The worker compiles every scenario at startup, then picks one **per job**.
-``ScenarioOrchestrator._resolve_scenario_for_job(payload)`` walks three
-sources, highest wins:
+- **Prompt steps** produce written output: the brief, the plan, the review.
+- **Build steps** are where the model actually works: an agentic tool loop that
+  reads, writes, and edits files in the project workspace. The filesystem is
+  the artifact — downstream steps receive the touched paths, not file dumps.
+- **Verifier steps** check the result without a model: does it build, does it
+  typecheck, is every route reachable. A failure feeds the specifics back to
+  the builder for a fix, with a bounded retry budget before the conflict
+  escalates upward.
+- **Gate steps** decide where the run goes next — a verdict of PASS routes
+  onward, FAIL routes back. Every branch taken is recorded as a gate decision
+  in the timeline.
+- **Fan-out steps** run children in parallel and merge them (majority pass,
+  weighted score, all pass).
+- **Approval steps** stop the run and ask a human.
 
-1. **Explicit pin** — ``payload.metadata["scenario_id"]``. Used by replay
-   fixtures, admin tools, and the future universal-input classifier that
-   wants to override the route mapping.
-2. **Intent-route mapping** — ``payload.metadata["intent_route"]`` looked up
-   in the ``intent_route → scenario_id`` index the loader built from each
-   scenario's ``intent_routes`` declaration. Lookup is case-insensitive.
-   Today's bundled mapping:
-   ``project → code_build``, ``document``/``writing → document_writing``,
-   ``task``/``qa → quick_qa``, ``research → research_brief``,
-   ``security_review → security_review``. Two scenarios claiming the same
-   route is a hard load error — the dispatch must be unambiguous.
-3. **Default** — ``AMOS_DEFAULT_SCENARIO`` env or ``code_build``. Also
-   the fallback when an explicit id is unknown or a route is unmapped (the
-   run continues with a warning log; a misconfigured payload must never
-   break the job).
+## What you see while it runs
 
-The selection appears in the ``scenario_started`` event as
-``selection_reason``: ``"explicit"``, ``"intent_route:<route>"``, or
-``"default"`` — useful for telemetry and "why did this scenario run?"
-debugging.
+The run canvas and step list tell the whole story live, without polling:
 
-## 3. Job invocation
+- Each step's node wears the **model's brand mark**, and the step row names the
+  model that ran it. If dispatch had to fall to the next model in the band,
+  the step corrects itself and badges the model that actually answered.
+- Steps the worker composed in code — deliberately, with no model call — are
+  labelled **"composed in code"** rather than left looking like a missing mark.
+- Verifier rows show pass/fail with scores and reasons; gate rows show which
+  branch fired and why; the budget ticker accumulates cost, tokens, and time.
 
-`run(payload, routing_decision, event_bus)` builds the initial
-`ScenarioState`:
+## Confirmations and approvals
 
-```python
-{
-  "scenario_id": ..., "scenario_version": ..., "payload": ...,
-  "routing_decision": ..., "event_bus": ...,
-  "context": compose_context(payload),       # the prompt-prepended block
-  "provider_candidates": ..., "chosen_provider": ..., "chosen_model": ...,
-  "levels": {}, "scratchpad": Scratchpad(job_id),
-  "tracker": EscalationTracker(max_attempts_per_conflict=3),
-  "escalate_now": False, "verdict": "",
-  "budget": scenario.budget, "budget_exceeded": False, "aborted_reason": None,
-  ... # aggregate cost/token counters
-}
-```
+A run parks — and tells you — whenever a human decision is needed:
 
-Then emits `scenario_started` and invokes `compiled.invoke(initial)`.
-LangGraph drives every node from the entry point (first level by YAML
-order) until the graph reaches `END`.
+- **Before the work starts**: confirming intent, picking a template and design,
+  and confirming the feature list are all user confirmations.
+- **Mid-run**: scope checks, clarification questions, and approval steps all
+  park the run. Every parked gate becomes a durable, addressable approval — so
+  the decision can land from the run's own panel, the approvals page, or
+  **Slack**, not only from the live stream. Answering resumes the run exactly
+  where it paused.
 
-## 4. Level dispatch
+## Budgets, stopping, and cancellation
 
-`ScenarioExecutor.run_level(state, level)` is the per-node body. It:
+Every scenario declares caps on cost, tokens, and duration. Hitting a cap
+aborts the run — remaining steps skip, and the run ends as `aborted` with the
+reason. You can also press **Stop** at any moment: the run ends as
+`cancelled` and partial work is discarded (nothing is committed or pushed) —
+only a fresh prompt starts over.
 
-1. Skip-fast when `state.aborted_reason` is set (budget kill switch
-   short-circuit). Returns a synthetic `skipped` level state and emits
-   `level_finished` with `ok=true, duration_ms=0`.
-2. Emits legacy `node_started` and new `level_started` (with
-   `level_id`, `role`, `kind`, `attempt`, `model_constraint_allow`).
-3. Calls the kind-specific runner.
-4. Emits `node_finished` + `level_finished` with cumulative duration,
-   cost, the output preview (first 200 chars from the level's delta), and
-   `provider` / `model` — the model that *actually* answered.
+## When it finishes
 
-   Both are omitted for any level that made no LLM call: only
-   `PromptLevelRunner` and `ToolLoopLevelRunner` write them into the level
-   state, so a gate, verifier, aggregator or `human_approval` level has no
-   `model` key at all. That absence is load-bearing, not an oversight — the
-   canvas reads it as "this level called nothing" and keeps the level's role
-   glyph instead of painting a model's brand mark on it. Do not default the
-   field.
+The run ends `completed`, and the timeline keeps the full story: which model
+ran each step, which verifiers passed or failed with what scores, which
+branches the gates took, what files were created, where it was deployed.
+Archived runs preserve the same per-step detail, so a run from last week reads
+as clearly as one from a minute ago.
 
-   A `prompt` level can also omit them *without* being a gate: when its builder
-   returns a `static_output` (the `code_build` L1 brief, composed from the
-   user's confirmed features so a product's reference material cannot expand
-   the scope), the runner makes no model call. It sets `deterministic=true` on
-   the level state, which this step forwards as `deterministic: true` on
-   `level_finished`. A `prompt` level is the one a person expects a model to
-   have written, so the UI uses the flag to say "composed in code — no model
-   call" instead of leaving the tile looking like a missing mark. It is a third
-   state, distinct from both `model` present and a gate's silent absence.
+## Under the hood
 
-   `level_finished` fires on completion, which is too late for the node a
-   person is watching, so the *running* window is covered by the per-level
-   `routing_decision` at step 3 below: it names the model we intend to call.
-   `level_finished` then supersedes it, which is how a runtime paid→free
-   reroute becomes visible. On the failure path neither field is emitted —
-   the runner raised, so no delta exists, and the only other source is the
-   previous attempt's model, which would mislabel the crash.
-
-### `kind: prompt` (`PromptLevelRunner`)
-
-1. Resolves the prompt builder via `get_prompt_builder(level.prompt_ref)`
-   and builds a `BuiltPrompt`.
-2. Emits `agent_handoff` + `prompt_sent` when the builder declared them
-   (suppressed on retries by the builder itself).
-3. Resolves the model via `resolve_model(level.model_constraint, routing_default)`
-   and emits `routing_decision` with `level_id` and the resolved tier /
-   provider / model / `constraint_source`.
-
-   This is a *per-level* event and the reason the canvas can name a model on
-   a step that is still running. Its `model` is the intended one and can be
-   `""`: `preferred_model` is only pinned when the level named exactly one
-   model, or when a user cost tier narrowed a bare `paid:*` wildcard — so on
-   a run where the user picked a compute budget it is populated, and on a
-   free-band level it is not. Note the legacy job-level `routing_decision`
-   from `graph/orchestrator.py` carries no `level_id`; consumers must ignore
-   that one rather than attribute a whole-job model to a single level.
-4. Wraps the call in `event_bus.heartbeat(...)` for L4-class long
-   generations.
-5. Calls `_call_with_ask_user(...)` — same `ask_user` clarification loop
-   as the legacy hierarchy.
-6. Records cost + tokens into the running aggregates, emits
-   `budget_consumed`.
-7. Runs `state.budget` check; on exceeded, sets `aborted_reason` and
-   emits `budget_exceeded`.
-8. Per-level post-processing:
-   - `l1_brief`: emits a Markdown brief (goal + acceptance criteria)
-     directly — no JSON envelope, no collapse step; its prose *is* the
-     level output L2/L3 read.
-   - `l3_accept` / `fact_check`: extract the verdict via
-     `_verdict_from_l3_output` — a trailing ` ```control ` fence first
-     (`worker/runtime/control_block.py`), then a lenient JSON path
-     (plain `{verdict}` or `extra.verdict`). When neither yields a clean
-     PASS/FAIL, a single bounded **repair-retry** re-asks with the
-     contract spelled out before falling through. The verdict is written
-     to `state.verdict`; FAIL registers a failure with the escalation
-     tracker and sets `escalate_now` when the conflict budget is hit.
-   - `polish` / `synthesis` / `answer` / `final_report`: terminal-output
-     levels; their `result.output` becomes `state.final_output`.
-9. If the level itself declared verifiers (e.g., an `llm_judge` rubric on
-   `l3_accept` or `fact_check`), the runner invokes them through the
-   `VerifierRunner` and folds the per-verifier outcomes into the level
-   state alongside the prompt result.
-
-### `kind: tool_loop` (`ToolLoopLevelRunner`)
-
-`l4_execute` and `l2_escalate` are **agentic file-tool loops** — the model
-mutates the project workspace through tool calls executed by the worker
-(Claude Code style: the **filesystem is the artifact**, not the message
-transcript). Downstream levels receive the *touched paths*, never file
-bodies.
-
-1. Builds the task prompt via `prompt_ref` (no Markdown file-fence
-   contract — the runtime provides the tools) and emits the
-   `agent_handoff` / `routing_decision` events like `prompt`.
-2. Loops up to `Level.metadata["max_iterations"]` (default 40):
-   - **paid** transport — `LlmProviders.call_model_turn(messages,
-     tools=anthropic_tools())` returns text plus native `tool_use` blocks;
-   - **free** transport — only when the *first* paid turn fails and the
-     level allows `fallback_outside_allow`: the textual ` ```tool ` /
-     ` ```tool_result ` protocol over `call_free_model`.
-3. Each tool call (`read_file` / `write_file` / `edit_file` / `list_dir`
-   / `delete_file` / `finish`) is dispatched via
-   `worker/runtime/file_tools.execute_tool` against `_project_cwd`,
-   sandboxed by `code_applier._safe_relative`. Every call streams a
-   `tool_call` + `tool_result` event; writes also emit `file_created`.
-4. The loop ends on `finish`, an empty turn, `max_iterations`, the
-   scenario budget, or a user **Stop** (`bus.is_cancelled()`, checked per
-   turn). Every turn's usage folds into the running aggregates.
-5. Writes the level state: `output` = the `finish` summary,
-   `touched_paths` = the runner's authoritative write-tool set. Terminal
-   tool-loop levels (`l2_escalate`) also set `state.final_output`.
-
-### `kind: verifier` (`VerifierLevelRunner`)
-
-1. The `l4_execute` tool loop already wrote its changes to disk, so there
-   is **no file-apply step** — the runner builds a `VerifierContext` with
-   the project workspace, payload, and scratchpad and runs the declared
-   verifiers directly.
-2. Emit `verifier_started` per declared verifier.
-3. Invoke `VerifierRunner.run(level.verifiers, ctx)`. Mode is
-   `serial`, `parallel`, or `race` (see
-   [scenarios-runtime.md][component]).
-4. Emit `verifier_finished` per result.
-5. Stash a one-line `build_result_summary` on the scratchpad (pass or
-   fail) so the `l3_accept` prompt can review plan-vs-done without
-   re-reading the workspace.
-6. On failure, format **every** failed verifier into a feedback string —
-   the build stderr tail plus any other gate's reasons (e.g. the
-   `route_reachability` orphan/misplaced-route list) — and stash it under
-   `build_feedback` so the next L4 retry fixes all blockers. Register
-   failure with the escalation tracker on conflict id `build_failure`.
-7. Emit `build_verify_passed` or `build_verify_failed` for legacy
-   compatibility.
-
-`code_build`'s `l3_build_verify` runs two verifiers: `build` (install +
-`next build`) and **`route_reachability`** — a deterministic, no-LLM gate
-that every Next.js App Router route is navigable from `/`. It flags
-*orphan* routes (a `page.*` nothing reachable from the home page links to)
-and *misplaced* pages (a `page.*` written into a parallel `app/` tree such
-as `apps/frontend/app/...`, which Next never routes), following
-`Link`/`href`/`router.push`/`redirect` targets transitively through
-imported components. Dynamic (`[id]`) and `api` routes are exempt, and a
-project with no `app/` dir skip-passes (so non-Next builds and the replay
-harness are untouched). The `l3_build_verify → l3_accept` edge ANDs both
-verifiers, so a navigability failure routes back to L4 with the offending
-routes — same retry/escalation budget as a build failure. `code_build_strict`
-adds it alongside `typecheck` + `lint`.
-
-### `kind: aggregator` (`FanOutLevelRunner`)
-
-1. Dispatches each child in `level.fan_out` through the same
-   `ScenarioExecutor` via a `ThreadPoolExecutor`. Each child runs through
-   its own kind runner (so a child can itself be `prompt`, `verifier`,
-   or `human_approval`).
-2. Merges child level states into the parent's `levels` slot so the
-   synthesis prompts can read them by id and the audit log retains every
-   child output.
-3. Hands the `ChildOutcome[]` to the aggregator named in
-   `level.fan_in.aggregator` (`majority_pass`, `weighted_score`,
-   `all_pass` by default).
-4. Sets the parent level's `output` to the aggregator's summary and
-   sets `state.verdict` to the aggregator's `PASS`/`FAIL` so the gate
-   router can branch off it.
-5. Checks the budget against the sum of children's cost (parallel
-   children each see only their own slice before the merge, so the
-   parent's post-merge check is what stops a fan_out from slipping past
-   the cap).
-
-### `kind: human_approval` (`HumanApprovalLevelRunner`)
-
-1. Builds the human-visible question via the level's `prompt_ref` builder.
-2. Emits `ask_user` with `call_id`, `interrupt_id`, `approver_role`, and
-   the level's `output_schema` (or a default `{approved, comment}`
-   schema).
-3. Calls `langgraph.types.interrupt(...)` which raises a `GraphInterrupt`
-   the worker's checkpointer catches; the run pauses until
-   `Command(resume=...)` lands.
-4. On resume, packages `{approved, comment}` into the level's
-   `output_parsed` and writes `state.verdict = PASS|FAIL`.
-5. Emits `tool_result` with the approval so the timeline shows the
-   decision landed.
-6. On reject, registers failure with the tracker under conflict
-   `human_approval:<level_id>` so a chain of rejections eventually trips
-   `escalate_now`.
-
-When the langgraph runnable context is missing (direct unit-test
-invocation outside `graph.invoke()`), the runner auto-approves with a
-loud log so the runtime stays testable without a real checkpointer.
-
-## 5. Gate routing
-
-After each level returns, LangGraph dispatches to the source's outgoing
-edges. For conditional edges:
-
-* The compiler's router evaluates each compiled expression in
-  `priority` order against a `MappingContext` built from `state`. The
-  context surfaces `verifier.<name>.<field>` from the current level's
-  verifier results, `verdict`, `escalate_now`, `confidence`,
-  `level.<id>.<field>`, and `scratchpad.<key>`.
-* The first matching edge wins. The router emits `gate_decision` with
-  `source_level`, `target_level`, `matched_expression`, and `reason`.
-* When nothing matches, the router falls through to `END` with a loud
-  log entry — scenarios should declare a default `when: None` edge to
-  avoid this.
-* **Kill-switch short-circuit:** when `state.aborted_reason` is set
-  (budget cap or user Stop), the router routes straight to `END` —
-  otherwise the stale state of skipped levels would route a retry edge
-  back into a loop (e.g. `l3_build_verify → l4_execute` forever).
-
-## 5b. What a node returns is what survives (2026-09-07)
-
-LangGraph persists a state channel **only when a node returns it in its delta**.
-A channel that a node mutates in place and forgets to return keeps whatever was
-last *written* — and that is invisible until the graph is re-hydrated from the
-checkpoint, which happens on every resume after an `ask_user` interrupt, every
-worker restart, and every re-enqueue. Inside one continuous execution the
-channel hands back the same Python object, so the mutation appears to stick.
-
-Two bugs came from this, both found on build wf-554.
-
-**The escalation budget reset.** `EscalationTracker.register_failure` mutates the
-tracker, and all three call sites in `graph/scenarios/runners.py` dropped it. So
-every re-hydration reset the attempt counts to zero and retry budgets restarted
-mid-run. wf-554 took **5 `l3_build_verify` laps against `max_attempts_per_conflict`
-= 3** — it interrupted for user input at 12:25 and resumed at 12:31, which is
-where the count reset. Each lap is a full `l4_execute` tool loop, so this is
-expensive rather than merely untidy. It did eventually escalate, so this is a
-budget that restarts, not one that never fires.
-
-The tell, straight from `checkpoint_blobs` for that thread:
-
-| channel | versions written |
-| --- | --- |
-| `levels` (returned in its delta) | 21 |
-| `scratchpad` (returned in its delta) | 6 |
-| `tracker` (mutated, dropped) | **1** — init only, 103 bytes |
-
-The level's own `attempts` counter incremented correctly the whole time because
-it rides in `delta["levels"]`: two counters for the same retry, one persisted.
-`_register_failure` now returns `(escalate, tracker)` so a caller cannot forget,
-and all three sites assign `delta["tracker"]`.
-
-**The audit bloat.** `ModelCallResult.to_audit_dict()` carries `input_text` (the
-whole prompt), `raw_response` (the whole provider response), `output_blocks` and
-`tool_calls`, and these were appended to `state["model_calls"]` — a checkpointed
-channel. The whole growing list was therefore re-serialized every superstep:
-**quadratic in call count**, with a build prompt as the constant. wf-554 wrote
-**289 MB across 13 versions** of that channel (largest single write 49 MB) plus
-49 MB on `audit_log`; that one run was 338 MB of a 418 MB database. Postgres here
-runs `shared_buffers` = 128 MB on a 1 CPU / 1 GB pod, so a single write evicted a
-third of the buffer cache and pushed out the small hot tables the dashboard
-reads — the mechanism behind "the UI is very slow". Even a healthy 42-call build
-wrote a 7.8 MB audit and 22 MB of checkpoints.
-
-Nothing in the graph reads those fields mid-run; every consumer is post-run
-(`job_runs.audit_log`, which mother-ai and the frontend read for raw responses
-and prompts, plus the replay harness). So `graph/scenarios/audit_sink.py` now
-takes the full entry — one row per call in `model_call_audit`, keyed by
-`prompt_id` — while graph state keeps a metadata-only entry, and the orchestrator
-reassembles the full list from the sink when it builds the `ScenarioResult`.
-Downstream shape is unchanged.
-
-`record_audit_entry()` is the single place that split is decided, because there
-are three record sites (prompt level, its verdict-repair follow-up, and each turn
-of the tool loop) and the easy bug is adding a fourth that forgets. The tool loop
-is the one that dominated: once per turn, up to `max_iterations`.
-
-The sink is reached through a ContextVar rather than a state field for the same
-reason the event bus is — declaring it on `ScenarioState` would make it a
-checkpointed channel.
-
-**The rule for new state:** if a node changes a mutable channel, return it. If a
-channel is a handle rather than data (a bus, a sink, a client), keep it off
-`ScenarioState` and reach it through a ContextVar.
-
-## 6. Termination
-
-When the graph reaches `END`, the orchestrator:
-
-1. Reads the terminal state and synthesizes a `ScenarioResult` (output =
-   `state.final_output` or fallback to `levels[l4_execute].output`).
-   It also carries `workspace_owned` (true when the scenario has a
-   `tool_loop` level), the `l3_build_verify` outcome, and `aborted_reason`
-   out to the thread runner.
-2. Emits `scenario_finished` with `status: completed | aborted |
-   cancelled`, `aborted_reason`, `total_cost_usd`, `total_tokens`,
-   `total_duration_ms`, and `levels_run`. `cancelled` is a user Stop;
-   `aborted` is a budget cap or a crash.
-
-The frontend's `ScenarioRunTimeline` consumes the event stream and
-derives the per-level / per-verifier / gate / budget views via the
-helpers in `apps/frontend/lib/workflow/scenario-events.ts`. The user
-sees the full story of the run — which model ran which level, which
-verifier passed or failed with what score, which branch the gate took —
-without polling any additional endpoint.
-
-## 7. User Stop
-
-A user can halt a running job from the workflow composer's Stop button
-at any step. The mechanism is a Redis flag, polled at safe points — no
-new thread, no signal handler:
-
-1. `POST /v1/jobs/:id/cancel` (mother-ai) sets `amos:job:{id}:cancel`
-   (1 h TTL), marks the job terminal `cancelled` in the Redis status hash,
-   and best-effort marks `prompt_threads.status='cancelled'` in Postgres —
-   so the UI unsticks immediately even if no worker is holding the job.
-2. The worker observes the flag via `EventBus.is_cancelled()` (a memoized
-   `EXISTS` check): the executor polls it at **every level boundary**,
-   `ToolLoopLevelRunner` once **per tool turn**, and the Anthropic
-   streaming loop cuts a doomed generation short.
-3. On detection the executor sets `aborted_reason="cancelled_by_user"` —
-   the same kill-switch path as a budget abort: all remaining levels
-   skip, the gate router short-circuits to `END`, and `scenario_finished`
-   fires with `status: "cancelled"`.
-4. A cancelled run **discards partial work**: `main.py` skips
-   `commit_and_push` and marks the job + prompt `cancelled`. Only a new
-   prompt in the same workflow starts a fresh run from L1.
-
-(Stop only halts an *actively-running* worker; orphaned jobs — where the
-worker died without recovery — are a separate, tracked infra gap.)
-
-## 8. Replay path
-
-For CI / regression detection, the same pipeline runs against
-`CassetteProviders` instead of live `LlmProviders`. The cassette is a
-list of recorded `ModelCallResult` dicts on a golden fixture; every
-prompt-runner / `call_model_turn` / llm_judge call pops the next entry in
-order — a `tool_loop` cassette entry carries the `tool_calls` the loop
-dispatches. The harness provisions an ephemeral git workspace for any
-scenario with a `tool_loop` level. Verifier results are byte-for-byte
-deterministic (subprocess output or schema validation), so the harness
-diffs the run's verifier scores + verdict + cost against the fixture's
-`expected` block. The CI gate fails on any regression beyond declared
-thresholds.
-
-[component]: ../components/scenarios-runtime.md
+- [Scenarios runtime](/developers/components/scenarios-runtime) — the engine:
+  flows as YAML, compiled and executed per job; verifiers; replay in CI.
+- [HTTP API & event stream](/developers/reference/api-and-events) — the event
+  contract the canvas renders.
+- [Model routing](/developers/reference/model-routing) — how each step's model
+  and its fallback band are chosen.

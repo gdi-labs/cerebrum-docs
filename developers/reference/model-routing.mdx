@@ -1,0 +1,97 @@
+---
+title: Model routing
+description: 'How a step''s model is chosen: the catalog that answers what exists,
+  the band that answers what this budget buys for this role, and the walk that answers
+  what happens when the pick fails. The user-facing story is in Free and paid models,...'
+---
+
+Key sources: `config/model_catalog.yaml` (the roster), `worker/worker/llm/catalog.py` (loader), `worker/worker/llm/tier_profiles.py` (bands), `worker/worker/llm/resolver.py` (resolution), `worker/worker/llm/providers.py` (dispatch and the band walk), `worker/worker/llm/quota.py` (free ledger).
+
+## The catalog
+
+`config/model_catalog.yaml` is the single answer to *what exists, what it can do, what it costs, and what its free quota is*. Provider identity used to live in five places that drifted independently (a pricing dict, a per-provider default, a `FREE_PROVIDERS` set, per-tier provider lists, a tool-gating prefix list); the catalog replaced all of them. Adding a provider is usually YAML and no code — ten of the eleven providers speak the same `openai_chat` wire.
+
+**It is capability, not permission.** A model listed there exists and can be reached; whether a team may use it is `config/team_controls.yaml`. Both load at worker boot. Unlike every other config loader in the worker, the catalog loader **raises** when its file is missing instead of degrading to defaults — `MODEL_CATALOG_PATH` and `TEAM_CONTROLS_PATH` must be absolute paths in any container. A silently degraded catalog once disabled every provider, the free pool, the effort ladder and capability routing while all of them appeared configured.
+
+Each model row carries:
+
+| Field | Meaning |
+| --- | --- |
+| `wire` | `anthropic` \| `openai_chat` \| `gemini` — one adapter per wire, not per vendor |
+| `features` | capability flags (`tool_use`, `reasoning`, `vision`, `json_mode`, `streaming`, `server_tools`, …) that routing matches against |
+| `cost_tier` | `free` \| `cheap` \| `mid` \| `frontier` |
+| `pricing_per_1k` | required for every non-free model — a lookup that defaulted to zero once recorded $0.00 for months |
+| `context_tokens` | context window; routing can require a minimum |
+| `quota` | required for free models (`rpm` / `tpm` / `rpd`) — the ledger cannot pace what it cannot see |
+| `effort` | per-vendor map from effort rung to request-body fragments |
+| `preference` | cost-tuned provider ordering inside its tier |
+
+Load-time invariants are enforced and fail fast: a non-free model without a price, a free model without a quota, an embedding model without `dimensions`, `thinking.budget_tokens ≥ max_output_tokens`, an `effort` map without the `reasoning` feature, and unknown fields are all rejected at load.
+
+## Cost tiers and capability routing
+
+Tiers are `free → cheap → mid → frontier`; cheap is roughly a tenth of frontier for reasoning-heavy work. A tier declares requirements and the catalog answers with everything that can meet it, filtered by capability **before** price is considered:
+
+```python
+"long_context":    {"min_context": 200_000}
+"high_reasoning":  {"features": ["reasoning"], "effort": "high"}
+"code_generation": {"features": ["tool_use"]}
+"multimodal":      {"features": ["vision"]}
+"fast_cheap":      {"effort": "none", "cost_tiers": ["free", "cheap"]}
+```
+
+Two deliberate details: `cheap` is **not** excluded from `high_reasoning` — among models that can think, a cheap one is the most competitive; and `free` appears only under `fast_cheap`, because a free model reached through paid dispatch bypasses the quota ledger entirely.
+
+## The compute budget becomes a band per role
+
+A user picking **Free / Cost-optimized / Frontier** on `/new` (default Cost-optimized, sent as job metadata `model_tier`) is answering a question no catalog can: *how much is this run worth?* The answer is applied per role, because a run is not one job — `worker/worker/llm/tier_profiles.py` keys on the `L1.`/`L2.`/`L3.`/`L4.` role prefix:
+
+| Budget | L1 (lead) | L2 (architect) | L3 (review) | L4 (executor) |
+| --- | --- | --- | --- | --- |
+| `free` | free | free | free | free |
+| `cheap` *(default)* | cheap | cheap | cheap | cheap |
+| `frontier` | cheap | frontier, mid | cheap | frontier, mid |
+
+The frontier profile buys a frontier architect and executor while planning and review stay cheap: short, well-structured tasks buy little from frontier tokens, and a weak architect hands the builder a plan it then works around. Bands whose leading tier is `mid`/`frontier` want the **strongest** model in the band (price is the tie-break within the tier — the catalog's own ordering is cost-tuned and would otherwise pick a different frontier model); bands leading with `cheap`/`free` want the cheapest. An unrecognized tier or role degrades to "no preference" — it must never raise.
+
+Capability still wins: the band applies after the level's requirements and is dropped, with a log, if nothing survives it. An explicit scenario pin (`allow: ["anthropic:claude-opus-4-8"]`) is never narrowed by a band.
+
+## When the pick fails, the band is a walk
+
+Resolution returns the whole ordered band as `ModelCandidate` pairs (`ResolvedModel.model_candidates`), not just the winner. On a failed request, dispatch walks it strongest-first — next model on the same provider, then the band's other providers — before any provider default:
+
+- A refused credential (401/403) marks the provider dead for the rest of the call; re-asking its other models with the same key is wasted round trips.
+- An unfunded account raises `ProviderUnfunded` by name and skips that provider for ~30 minutes. Vendors report this inconsistently (DeepSeek 402, Zhipu 429 with code 1113), so the response body is read, not the status code.
+- A spent free quota skips the model until its window rolls — not a health failure.
+- A tool loop walks the band **only until its first successful turn**: before that, messages are wire-agnostic user text; after, the tool-call history is vendor-shaped and switching models mid-conversation would corrupt it.
+
+A scenario `fallback:` entry lands in the candidate list too, so a pinned model's named fallback is what actually gets tried. The walk is observable: `routing_decision` carries `model_candidates`, and a hop emits a `model_fallback` event (`from_model`, `to_model`, `reason`) that the UI uses to correct the step's model live — see [HTTP API & event stream](/developers/reference/api-and-events).
+
+On the shipped catalog the frontier band is `claude-opus-4-8 → claude-opus-4-7 → kimi-k3 → glm-5.2 → claude-sonnet-4-6`; `glm-5.2` sits on a non-Anthropic provider deliberately, so the band has an escape hatch when Anthropic itself is down.
+
+## The effort ladder
+
+Levels ask for `none | low | medium | high | max`; each model's `effort` map translates a rung into that vendor's request shape (a thinking budget, a `reasoning_effort` enum, a boolean switch). Three rules:
+
+- **A missing rung rounds up.** A level asking to think harder must never be answered with less thinking; only after exhausting stronger rungs does it fall back to the model's ceiling.
+- **`none` never rounds up** — it is a ceiling, not a floor.
+- **Effort on a non-reasoning model is dropped**, logged, never raised.
+
+Precedence: the level's constraint beats a `@rung` suffix on a resolver pattern, which beats a tier default (`high_reasoning` implies `high`). Every call records the rung it asked for and the reasoning tokens it consumed, folded per job as the **strongest** rung ("how hard did this job think") and the **sum** ("what did that cost").
+
+## The free-quota ledger
+
+Free tiers fail by *refusing* rather than by billing, so they need pacing, not a budget. `worker/worker/llm/quota.py` keeps fixed-window counters in Redis, keyed per model — per API key means per organization, not per pod, so every worker replica must share one count. `rpm`/`rpd` are exact; `tpm` reserves a deliberately high estimate and settles the true value after the response. A 429 sets a cooldown. Every method degrades **permissive** on a Redis error — a ledger that blocked calls when its own store was unreachable would convert a Redis blip into a free-tier outage. `GET /v1/models` reads the same keys, so the Free Tier tile shows what the next dispatch will actually see.
+
+## Adding a provider
+
+1. Add a `providers:` entry: `wire`, `base_url`, and `auth` (a Secrets Manager `secret_id` under `cerebrum/providers/*`, an env var, or both — env wins for local override).
+2. Add one `models:` row per flavour, with its real price and features.
+3. Permit it in `config/team_controls.yaml`.
+4. Put the key in Secrets Manager (`terraform/modules/provider-secrets/` owns the naming).
+
+`team_controls.yaml` is a **hard filter**: an omitted provider is removed from every candidate order with no error. Its tests assert the direction that fails silently — every catalog model permitted, every preferred provider allowed.
+
+## Troubleshooting a provider that "doesn't work"
+
+In order: (1) is the catalog path set and loaded (an empty path means only Anthropic is reachable); (2) does `GET /v1/models` show the provider `configured` and the model `allowed`; (3) is it permitted in `team_controls.yaml`; (4) does the model declare the feature the level requires (a capability refusal names both); (5) is the account funded. Each rule rules out the next.

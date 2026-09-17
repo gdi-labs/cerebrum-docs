@@ -1,124 +1,77 @@
 ---
 title: Declarative agent flows
-description: 'Amos runs every paid job through a scenario: a versioned YAML file that
-  describes the agent flow as a DAG of levels. Adding a new flow is a PR that touches
-  knowledge-hub/scenarios/; no worker deploy is required once the underlying primit...'
+description: 'Amos runs every paid job through a scenario: a versioned blueprint that
+  describes the agent flow as a graph of levels. Adding or tuning a flow is a configuration
+  change, not a code deploy.'
 ---
 
-## What you can express in a scenario
+## What a scenario can express
 
-| Concern                       | YAML field                                  |
-|------------------------------|---------------------------------------------|
-| Sequence of levels            | `levels: [...]` (ordered, ids unique)       |
-| How a step reads in the UI    | `display_name: Confirm scope` + `description: <one line>` (presentation-only) |
-| Branching                     | `edges: [{from, to, when}]` with a typed boolean DSL |
-| Parallel children             | `kind: aggregator` + `fan_out: [...]` + `fan_in.aggregator: <name>` |
-| Human gate                    | `kind: human_approval` + `prompt_ref` + `metadata.approver_role` |
-| Per-level model pinning       | `model_constraint: { allow: ["anthropic:claude-opus-4-7"], fallback: [...], fallback_outside_allow: false }` |
-| Tier wildcards (legacy parity)| `allow: ["free:*"]` or `["paid:*"]`         |
-| Deterministic verifiers       | `verifiers: [{name: build}, {name: typecheck}, ...]` with `mode: serial \| parallel \| race` |
-| LLM-judge soft signal         | `verifiers: [{name: llm_judge, params: {rubric_ref: rigor, min_score: 0.7}, on_fail: continue}]` |
-| Budget kill switch            | `budget: {max_cost_usd, max_tokens, max_duration_s}` |
-| Schema validation             | `verifiers: [{name: schema, kind: intra, params: {schema: {...}}}]` |
-| Retry / escalate policy       | `on_fail: retry \| escalate \| continue \| abort`, `max_retries` |
-| Confidence-aware gates        | `verdict == 'PASS' && confidence >= 0.7` in an `edge.when` |
+- An ordered sequence of levels, each with a plain-language name and a
+  one-line description shown in the UI.
+- Branching on typed conditions — verdicts, confidence thresholds.
+- Parallel fan-out to child levels, joined by an aggregator.
+- A human-approval checkpoint with an approver role.
+- Per-level model pinning with a fallback band.
+- Quality gates: deterministic checks (build, typecheck, output
+  format) run serially, in parallel, or as a race; an LLM judge can
+  score a level against a versioned rubric, blocking or advisory.
+- A budget kill switch (cost, tokens, duration) and a per-level
+  failure policy: retry, escalate, continue, or abort.
 
 ## What you get for free
 
-* **Lifecycle events**: every level emits `level_started`, `level_finished`,
-  and per-verifier `verifier_started` / `verifier_finished`. Gate routing
-  emits `gate_decision`. The job UI renders all of these in the per-level
-  cards inside the job detail panel.
-* **Live cost + token telemetry**: `budget_consumed` after every model call
-  drives the live budget chip; `budget_exceeded` flips it red and aborts
-  the run.
-* **Reproducibility**: each scenario carries a `version` (semver) and a
-  `checksum` (sha256 of canonical YAML) recorded on every job's terminal
-  state.
-* **Cassette-replayed CI gate**: every PR that touches a scenario YAML or
-  the runtime modules runs the replay harness against the scenario's
-  bundled golden fixtures; the gate fails on any verifier or rubric-score
-  regression beyond `regression_thresholds`.
-* **Tenant overrides**: a Postgres-backed partial YAML deep-merges over
-  the base at orchestrator construction time, so a customer can tune
-  budgets / constraints / verifier weights without forking the base
-  scenario.
-* **A run canvas that reads as a flow**: the compiled DAG ships inside
-  `scenario_started`, so the decision graph lays itself out before the
-  first level runs. See below for what the layout does with it.
+* **Live run detail** — every level and every check reports progress
+  as per-level cards in the job detail panel.
+* **Live cost + token telemetry** — the budget chip updates live,
+  flips red when the budget is exceeded, and the run aborts.
+* **Reproducibility** — each run records the exact scenario version
+  and checksum that produced it.
+* **Tenant overrides** — budgets, constraints, and verifier weights
+  can be tuned per customer without forking the base scenario.
 
 ## How the run canvas reads a scenario
 
-`AgentFlowGraph` (`apps/frontend/components/workflow/graph/`) turns the
-topology into an actor-lane grid: one column per role tier (`L1`, `L2`,
-…, in first-appearance order), levels owned by the same actor stacked
-inside it. Three rules make a live run legible:
+The canvas lays the flow out as an actor-lane grid — one column per
+role tier (L1, L2, …, in first-appearance order), the decision graph
+in place before the first level runs. Three touches keep a live run
+legible:
 
-* **Named steps.** A level's `display_name` sits under the actor on the
-  card and next to it in the activity timeline, in the slot the raw level
-  id used to own — so `code_build` reads "TEAM LEAD · Write the brief"
-  rather than a second indistinguishable "Team Lead". `description` is
-  the card's hover tooltip and the timeline's second line, where it
-  doubles as the disclosure toggle for that step's live output.
-  `description` is truncated to 160 chars on the wire to keep the
-  topology payload ~1 KB.
-* **Dead branches lift out of the way.** Levels the run never visited are
-  placed on negative rows — the band *above* the spine — so an unfired
-  branch like `l2_escalate` stops sitting between `l2_plan` and the edge
-  that routes around it. A level alone in its lane (the synthetic
-  `L0.router` placeholder) stays on the spine. Skipped status is only
-  known at runtime, so this resolves once, when the run terminates and
-  the still-`planned` levels flip to `skipped`; the nodes glide rather
-  than jump.
-* **Edges enter the right face, and only the ambiguous ones are
-  arrowed.** An edge whose source sits *lower* than its target enters
-  through the target's bottom face rather than its side, so retries and
-  escalations don't cut horizontally across the rows between them; a
-  backward edge between two lanes on the same row loops underneath
-  instead of sharing a gutter with the forward edge. Forward flow — left
-  to right across lanes, top to bottom within one — carries no
-  arrowhead, since the layout already says which way it runs. Only the
-  edges that double back get one, tinted to match their live state.
+* **Named steps.** Cards and timeline entries read "TEAM LEAD · Write
+  the brief" instead of a second indistinguishable "Team Lead"; the
+  description is the card's hover tooltip and toggles that step's live
+  output in the timeline.
+* **Dead branches lift out of the way.** Levels the run never visited
+  sit on the band *above* the spine instead of between live steps —
+  resolved at run end, with the nodes gliding rather than jumping.
+* **Only ambiguous edges are arrowed.** Forward flow — left to right
+  across lanes, top to bottom within one — carries no arrowhead; the
+  retries and escalations that double back do, tinted to their live
+  state.
 
 ## What's bundled
 
-Seven scenarios cover code, writing, research, security, and Q&A:
+Seven scenarios cover code, writing, research, security, and Q&A (the
+three rubrics are versioned separately):
 
-* **`code_build`** — L1 brief → L2 plan → L4 execute → L3 build verify →
-  L3 accept. The default for paid project jobs.
-* **`code_build_strict`** — adds parallel build + typecheck + lint and an
-  llm_judge architecture-review signal on L3 accept.
-* **`document_writing`** — outline → research → draft → fact_check (JSON
-  verdict + llm_judge) → polish.
-* **`research_brief`** — decompose → fan_out[web, kb, academic] →
-  synthesis with an llm_judge rigor signal.
-* **`quick_qa`** — single free-tier level with a schema intra-verifier;
-  sub-second JSON-envelope answers.
-* **`security_review`** — triage → fan_out[semgrep, gitleaks] →
-  Opus-pinned LLM analysis → human_approval gate → final report.
-* **`parallel_review_demo`** — fan_out test scaffold; not a production
-  flow.
+* **`code_build`** — brief → plan → execute → build verify → accept.
+  The default for paid project jobs.
+* **`code_build_strict`** — adds parallel build + typecheck + lint and
+  an LLM-judge architecture-review signal.
+* **`document_writing`** — outline → research → draft → fact check →
+  polish.
+* **`research_brief`** — decompose → fan out across web, knowledge
+  base, and academic sources → synthesis with a rigor signal.
+* **`quick_qa`** — one free-tier level with an output-format check;
+  sub-second answers.
+* **`security_review`** — triage → parallel scanner passes →
+  Opus-pinned analysis → human approval gate → final report.
+* **`parallel_review_demo`** — a fan-out test scaffold, not a
+  production flow.
 
-Rubrics: `architecture_review_v1`, `fact_check_v1`, `rigor_v1`. Each
-versioned independently (`<id>_v<N>.md`), surfaced via the
-`llm_judge` verifier's `rubric_ref` param.
+## Under the hood
 
-## Authoring path
-
-1. Drop a new `<scenario_id>.yaml` under `knowledge-hub/scenarios/`.
-2. If the flow needs new prompt builders, register them in
-   `worker/worker/graph/scenarios/prompts.py`
-   via `@register_prompt_builder("<name>")`.
-3. If the flow needs a new verifier, subclass `Verifier` in
-   `worker/worker/runtime/verifiers/`
-   and register it in `builtins/__init__.py`.
-4. Capture 2-3 golden fixtures under
-   `knowledge-hub/scenarios/<scenario_id>/golden/*.json` with `input`,
-   `cassette` (recorded model responses), and `expected` verdict /
-   verifier scores.
-5. Open the PR. CI replays the fixtures and posts a verifier-score diff;
-   reviewer signs off.
-
-See [Scenario execution](/how-it-works/scenario-execution) for the
-runtime walkthrough and [Scenarios runtime](/developers/components/scenarios-runtime)
-for the module-by-module API.
+The scenario format, runtime, and authoring workflow are on
+[Scenarios runtime](/developers/components/scenarios-runtime); a
+level-by-level run walkthrough is on
+[Scenario execution](/how-it-works/scenario-execution).

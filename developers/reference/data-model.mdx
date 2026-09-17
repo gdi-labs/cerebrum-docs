@@ -1,0 +1,76 @@
+---
+title: Data model
+description: 'Where state lives: one Postgres (the durable record), one Redis (the
+  live/ephemeral layer), one Qdrant (vectors). None of the database layer is publicly
+  reachable — only the services in front of it are.'
+---
+
+Ownership matters: the [Auth service](/developers/components/auth) owns all database access on behalf of the frontends (which hold no credentials). The worker owns its schema via an idempotent `ensure_schema()` at boot; Mother AI manages its own tables and id sequences. Schema facts below are the durable vocabulary — table purposes, not full column lists.
+
+## Postgres
+
+### Identity & authorization (Auth service / Better Auth schema)
+
+| Table | Purpose |
+| --- | --- |
+| `user`, `account`, `session`, `verification` | Better Auth core: users, credential/OAuth accounts, sessions, verifications. New users land disabled (`banReason: pending_approval`) unless auto-promoted. |
+| `auth_audit_log` | Every admin mutation (role change, disable, budget change) writes a row. |
+
+### Delivery core
+
+| Table | Purpose |
+| --- | --- |
+| `projects` | Project registry; collision-free slugs, repo/branch/deployment metadata in `metadata`. |
+| `workflow_runs` | One row per workflow (a run of a scenario graph); carries the job's `metadata` JSON. |
+| `prompt_threads` | The link between a workflow and its prompts — `workflow_id` is the join that renders one run as one story. Statuses include `cancelled`. |
+| `job_runs` | Per-job status, cost, and `audit_log` for raw request/response inspection. |
+| `model_call_audit` | One row per model call (keyed by `prompt_id`): full prompt, raw response, tool calls. Split out of graph state so checkpointing stays small. |
+| `approvals` | Durable, listable record for every parked human gate — in-graph scope/clarify gates, `ask_user` calls, and pre-graph confirmations. Idempotent per gate; decisions can land from the UI or Slack. |
+
+### Work management & skill acquisition
+
+| Table | Purpose |
+| --- | --- |
+| `work_types`, `work_items`, `work_item_facets` | The typed-work catalog (software, initiative, research, …) and planned items with their facets. |
+| `initiatives`, `initiative_integrations` | Long-running initiatives and their external integrations. |
+| `capabilities`, `capability_roadmaps`, `capability_ledger` | Acquired capabilities, planned roadmaps, and the activation ledger. |
+| `acquisition_runs`, `acquisition_units` | Roadmap reconciliation: one unit per acquisition step, the durable record when a scheduler-triggered pass has no stream. |
+| `ventures`, `discovered_ventures`, `vertical_packs` | Open-world vertical discovery results and installed packs. |
+| `scheduled_tasks` | Scheduler-owned recurring work. |
+
+### Slack, knowledge, platform
+
+| Table | Purpose |
+| --- | --- |
+| `slack_threads`, `user_slack_identities` | Thread ↔ job linkage for replies, and Slack-member ↔ user identity mapping. |
+| `kb_documents`, `kb_ingest_manifest` | Knowledge-hub documents (also rendered by the Atlas and the QA sources panel) and the ingest manifest. |
+| `kb_query_audit`, `kb_edit_audit` | Who asked/edited what. |
+| `tenant_scenario_overrides` | Per-tenant partial scenario YAML deep-merged over the base at orchestrator construction. |
+| `tenant_tool_secrets`, `integration_events` | Tenant-provided credentials for external tools; inbound integration events. |
+| `executor_leases`, `worktree_lanes` | Worker coordination: executor leases and worktree lanes. |
+
+Two Postgres sequences (`cerebrum_workflow_id_seq`, `cerebrum_prompt_id_seq`) allocate the `wf-N` / `pt-N` identifiers, self-aligning past the highest id any table has issued — ids live where the rows they name live, not in a counter that can restart. Project slugs are allocated with bounded retry: scan for `base` and `base-%` collisions, take the first free `-N` suffix from `-2`, insert, and retry on the `idx_projects_slug` unique-index violation if another worker wins the race (8 attempts). That unique index (and dropping the old `name UNIQUE`) is an idempotent migration in the worker's `ensure_schema()`. The LangGraph checkpointer adds its own `checkpoints*` tables for interrupt/resume.
+
+## Redis
+
+Short-lived and coordination state; nothing here is the durable record.
+
+| Key pattern | Purpose |
+| --- | --- |
+| `cerebrum:{instance_id}:jobs` | The job queue Mother AI enqueues onto and the worker consumes. Pinned explicitly by Terraform on all services. |
+| `amos:job:{id}:events` (+ pub/sub channel) | The event backlog each SSE stream replays, then the live channel it joins. |
+| `amos:job:{id}:cancel` | User Stop flag (1 h TTL), polled by the worker at level boundaries and per tool turn. |
+| `amos:job:{job_id}:scratchpad` | Scenario-scoped KV available to every level via the `scratchpad.{get,put,list}` tools. |
+| `cerebrum:quota:{model}:{window}:{bucket}` / `…:cooldown:{model}` | The free-quota ledger's fixed-window counters and 429 cooldowns, shared across all workers. |
+| `cerebrum:{instance_id}:ratelimit:{user\|org}:{id}:{bucket}` | Ingress rate limits. |
+| `cerebrum:{instance_id}:seq:{…}` | Legacy counter allocator — used only when no `POSTGRES_DSN` is configured. |
+
+## Qdrant
+
+| Collection | Provisioned by | Notes |
+| --- | --- | --- |
+| `cerebrum_knowledge_hub` | the hub-ingest CronJob (`ingest/ingest_hub.py`) | The worker checks it exists and never creates it; the ingest side owns its width and payload indices. |
+| `cerebrum_user_rules` | worker startup preflight | User-authored rules; no payload indices (no call site filters). |
+| `cerebrum_facts` | worker startup preflight | User-authored facts; as above. |
+
+A collection's width is permanent — Qdrant cannot resize — so collections are created at the configured embedding width, never at whichever vector arrives first. A width mismatch is logged as an error and left alone; recreating is data loss and an operator's call. Retrieval failures are classified (missing collection vs query failure), logged, and surfaced as `retrieval_degraded` / `retrieval_failures` on the augmented prompt — while **zero results are not degradation**: an empty rules collection is the normal steady state.

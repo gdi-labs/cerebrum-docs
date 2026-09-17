@@ -1,0 +1,102 @@
+---
+title: Auth
+description: The identity and authorization service. A Hono + Better Auth service
+  deployed to EKS behind nginx ingress at https://auth.startamos.io, owning all database
+  access on behalf of the frontends — the Vercel-hosted Next.js app holds no databa...
+---
+
+```
+browser ──sign-in──────────────► auth.startamos.io  (Better Auth)
+   │                                      │
+   │                                      ├── Google OAuth
+   │                                      └── cerebrum Postgres (ClusterIP only)
+   │
+   └──app──► platform.startamos.io ──/internal/preflight──► auth.startamos.io
+                  (Next BFF)
+```
+
+One service serves every app host, so its config is global: enabling a sign-in method enables it everywhere, and the session cookie is shared across all of them.
+
+## HTTP surface
+
+| Path | Notes |
+| --- | --- |
+| `GET /healthz` | k8s liveness/readiness probe (no DB hit). |
+| `GET\|POST /api/auth/*` | Better Auth handler — sign-in, OAuth callback, session, sign-out, admin plugin (`/api/auth/admin/list-users`, `set-role`, `ban-user`, …). |
+| `GET /internal/preflight?workflow=&job=&budget=1` | One-call guard for the Vercel BFF — resolves the session and (optionally) asserts workflow/job ownership and within-budget. Status codes: 401 / 403 / 404 / 402 / 200. |
+| `GET /me/budget` | Settings panel — budget vs. month-to-date spend. |
+| `GET /admin/users` | Admin table — every user with role / status / budget / spend. |
+| `PATCH /admin/users/:id` | `{ disabled?, role?, budgetCents? }`. Self-disable / self-demote blocked. Writes `auth_audit_log`. |
+
+## Session model
+
+The session is a **cross-subdomain cookie** issued with `domain = BETTER_AUTH_COOKIE_DOMAIN` (`.startamos.io`), which must be a parent of every app host — otherwise the app never sees the session and its middleware bounces every request to `/login`. Consequences:
+
+- A session created on one host is live on all of them.
+- Adding or renaming an **app** host requires no Google Console change — Google only ever sees this service's callback (`${BETTER_AUTH_URL}/api/auth/callback/google`, derived from `auth_ingress_host` in Terraform). Renaming the **auth** host does.
+- Database-backed sessions carry a 5-minute cookie cache.
+- The Next app's `middleware.ts` gate is optimistic (cookie presence); the real check is the BFF's `requireAccess()` round trip to `/internal/preflight`. A misconfigured `AUTH_BASE_URL` therefore degrades to *looks logged out* on pages, while API routes fail loudly with 500/502.
+
+## Sign-in methods
+
+Asymmetric by design:
+
+- **Google** — open to anyone with a Google account. First sign-in creates a user that is `banned: true` / `banReason: pending_approval` unless the address is in `ADMIN_EMAILS` (a `databaseHooks` create hook implements the invite-only gate), so access stays invite-only without closing the OAuth flow.
+- **Email + password** — `disableSignUp: true`, so `POST /api/auth/sign-up/email` is closed to the public. Accounts are minted by an admin (`authClient.admin.createUser`), land banned like any other new user, and are enabled via `PATCH /admin/users/:id`. `/sign-in/email` is rate-limited to 10 attempts per 15 minutes per IP. The frontend's `NEXT_PUBLIC_ENABLE_PASSWORD_LOGIN` controls only whether the form *renders*; the endpoint is enabled service-wide.
+
+## Budgets
+
+Per-user monthly USD budgets (`budgetCents`), set by admins; new approved users default to `DEFAULT_BUDGET_USD`. Once a member's month-to-date spend reaches the cap, new runs are refused with HTTP 402 — a **soft** cap, checked at submission, so a running job can overshoot. Admins are exempt.
+
+Size budgets from measured spend, not a guess: across 229 workflows (2026-08) the average was $0.95, p90 $3.42, and the most expensive single workflow ever was $16 — so a reviewer/demo account at $50 clears a 402 mid-demo while capping the blast radius of a shared credential on a public endpoint.
+
+## The Google OAuth client is manual, external state
+
+The client lives in **Google Cloud Console project `509857089804`** (the tfvars holding its id/secret are gitignored, so this document is the record of where it is). Changing `auth_ingress_host` has a mandatory manual prerequisite: add `https://<new auth host>/api/auth/callback/google` to that client's authorized redirect URIs, and add the apex to the consent screen's authorized domains (which requires domain verification in Search Console). Skip it and every sign-in fails with `redirect_uri_mismatch`.
+
+## Hosts and branches
+
+| Host | Branch | Role |
+| --- | --- | --- |
+| `platform.startamos.io` | `master` | Vercel Production; public/demo surface |
+| `next.startamos.io` | `next` | branch deployment, behind Vercel SSO |
+| `trial.startamos.io` | `stable` | not provisioned yet |
+| `auth.startamos.io` | — | this service, on EKS |
+
+All frontend hosts share one backend — one Mother AI, one auth service, one Postgres; the branch split separates frontend code only, not data. The apex `startamos.io` is a different Vercel project (the marketing site).
+
+## Frontend integration
+
+- `lib/auth/client.ts` — browser Better Auth client pointed at `NEXT_PUBLIC_AUTH_BASE_URL`, with the admin client plugin.
+- `lib/auth/guards.ts` — `requireUser` / `requireAdmin` (pages) and `requireApiUser` / `requireApiAdmin` (route handlers); identity resolves by forwarding the session cookie to `/internal/preflight`.
+- `lib/auth/access.ts` — `requireAccess()` (the single-round-trip guard) and `proxyToAuthService()` for `/api/admin/*` and `/api/me/budget`.
+- `lib/auth/workflow-scope.ts` — `stampActor` forces `created_by` from the session server-side; `requireWorkflowAccess` / `requireJobAccess` enforce ownership (admins bypass).
+- `lib/auth/fetch-failure.ts` — unwraps undici `cause`/`AggregateError` codes (`ENOTFOUND`, `ECONNREFUSED`, `UND_ERR_CONNECT_TIMEOUT`) into preflight error bodies and logs, so an unreachable auth service is diagnosable from the response.
+- `middleware.ts` — optimistic cookie gate on page routes; `app/(authenticated)/` sits behind a server-side `requireUser()`, `app/login/` renders outside it.
+
+## Environment
+
+| Variable | Required | Notes |
+| --- | --- | --- |
+| `DATABASE_URL` | yes | Cerebrum Postgres (in-cluster DSN). |
+| `BETTER_AUTH_SECRET` | yes | Signs sessions. |
+| `BETTER_AUTH_URL` | yes | Public origin of this service. |
+| `BETTER_AUTH_COOKIE_DOMAIN` | yes | Parent domain for cross-subdomain cookies; must parent every app host. |
+| `TRUSTED_ORIGINS` | yes | Comma-separated origins allowed to call `/api/auth/*` and receive the cookie; feeds both Better Auth and Hono CORS — a missing origin fails at the preflight, not at sign-in. |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | yes | OAuth client; redirect URI derived from `BETTER_AUTH_URL`. |
+| `ADMIN_EMAILS` | yes | Auto-promoted to admin on first sign-in. |
+| `DEFAULT_BUDGET_USD` | no | Default monthly budget for new approved users (25). |
+| `DATABASE_SSL`, `DATABASE_POOL_MAX`, `PORT` | no | TLS, pool cap (10), listen port (8080). |
+| `BANNED_REDIRECT_URL` | no | Where banned OAuth callers land. Single value — point it at the canonical host's `/login`; a relative path resolves against *this* service and renders a dead page. |
+
+## Operations
+
+- **Deploy**: `terraform/modules/auth` provisions deployment + ingress; env arrives via `envFrom.secretRef`, so a `terraform apply` needs `kubectl rollout restart deployment/auth -n cerebrum` to take effect. Container image in ECR (`cerebrum/auth`).
+- **Seeding a credential account** without a browser session: generate the hash with Better Auth's own crypto (`kubectl exec -n cerebrum deploy/auth -- node -e 'import("better-auth/crypto").then(async m => console.log(await m.hashPassword("<password>")))'`), then insert a `user` row plus an `account` row with `providerId = 'credential'`, `accountId = <user id>`, `password = <hash>`. Direct inserts **bypass the create hook** — set `role`, `banned`, `banReason`, and `budgetCents` explicitly. Credentials are never recorded in the repo.
+- **Trust boundary**: `TRUSTED_ORIGINS` and the cookie domain are the two settings where a typo fails *silently* (preflight rejections, bounce-to-login loops) rather than at deploy time.
+
+## Tests
+
+- Auth service: `cd auth && npx --no-install tsc --noEmit`.
+- Frontend: `cd apps/frontend && npx --no-install tsc --noEmit`, `npx --no-install biome check .`, `pnpm build`.
+- End-to-end (manual): sign in with Google as a non-admin → pending screen; as an `ADMIN_EMAILS` account → full access; approve the pending user; confirm per-user workflow isolation; drop a budget → 402; disable a user → session revoked; `POST /api/auth/sign-up/email` → 4xx; repeated bad passwords → 429; sign in on one host, open another → session already live.
