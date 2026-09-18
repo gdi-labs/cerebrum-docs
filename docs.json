@@ -39,7 +39,6 @@
             "pages": [
               "how-it-works/agent-hierarchy",
               "how-it-works/knowledge-hub",
-              "how-it-works/project-slug-identity",
               "how-it-works/scenario-execution"
             ]
           }
