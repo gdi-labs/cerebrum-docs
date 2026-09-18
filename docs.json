@@ -29,18 +29,9 @@
               "capabilities/knowledge-grounding",
               "capabilities/multi-model",
               "capabilities/audit-and-cost",
-              "capabilities/aws-pulse-report",
               "capabilities/declarative-agent-flows",
-              "capabilities/frontend-authentication",
-              "capabilities/hide-workflow",
-              "capabilities/internationalization",
-              "capabilities/project-console",
-              "capabilities/requirements-clarification-gate",
-              "capabilities/scenario-aware-job-panel",
               "capabilities/slack-conversation",
-              "capabilities/solutions-catalog",
-              "capabilities/universal-input",
-              "capabilities/user-feedback-system"
+              "capabilities/universal-input"
             ]
           },
           {
@@ -106,6 +97,42 @@
     {
       "source": "/developers/components/mcp-cerebrum-kb",
       "destination": "/developers/components/mcp-amos-kb"
+    },
+    {
+      "source": "/capabilities/aws-pulse-report",
+      "destination": "/capabilities/declarative-agent-flows"
+    },
+    {
+      "source": "/capabilities/frontend-authentication",
+      "destination": "/developers/components/auth"
+    },
+    {
+      "source": "/capabilities/hide-workflow",
+      "destination": "/welcome"
+    },
+    {
+      "source": "/capabilities/internationalization",
+      "destination": "/welcome"
+    },
+    {
+      "source": "/capabilities/project-console",
+      "destination": "/welcome"
+    },
+    {
+      "source": "/capabilities/requirements-clarification-gate",
+      "destination": "/capabilities/universal-input"
+    },
+    {
+      "source": "/capabilities/scenario-aware-job-panel",
+      "destination": "/how-it-works/scenario-execution"
+    },
+    {
+      "source": "/capabilities/solutions-catalog",
+      "destination": "/capabilities/declarative-agent-flows"
+    },
+    {
+      "source": "/capabilities/user-feedback-system",
+      "destination": "/capabilities/universal-input"
     }
   ],
   "footer": {
